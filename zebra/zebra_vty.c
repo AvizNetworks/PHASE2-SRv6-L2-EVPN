@@ -3373,6 +3373,16 @@ DEFUN (show_evpn_mac_vni,
 	return CMD_SUCCESS;
 }
 
+ALIAS (show_evpn_mac_vni,
+       show_evpn_mac_evi_cmd,
+       "show evpn mac evi " CMD_VNI_RANGE "[json]",
+       SHOW_STR
+       "EVPN\n"
+       "MAC addresses\n"
+       "SRv6 L2 EVPN Instance\n"
+       "EVI number\n"
+       JSON_STR)
+
 DEFPY (show_evpn_mac_vni_detail,
        show_evpn_mac_vni_detail_cmd,
        "show evpn mac vni " CMD_VNI_RANGE " detail [json]",
@@ -3628,6 +3638,16 @@ DEFUN (show_evpn_neigh_vni,
 	zebra_vxlan_print_neigh_vni(vty, zvrf, vni, uj);
 	return CMD_SUCCESS;
 }
+
+ALIAS (show_evpn_neigh_vni,
+       show_evpn_neigh_evi_cmd,
+       "show evpn arp-cache evi " CMD_VNI_RANGE "[json]",
+       SHOW_STR
+       "EVPN\n"
+       "ARP and ND cache\n"
+       "SRv6 L2 EVPN Instance\n"
+       "EVI number\n"
+       JSON_STR)
 
 DEFUN (show_evpn_neigh_vni_all,
        show_evpn_neigh_vni_all_cmd,
@@ -4422,6 +4442,7 @@ void zebra_vty_init(void)
 	install_element(VIEW_NODE, &show_evpn_nh_svd_cmd);
 	install_element(VIEW_NODE, &show_evpn_nh_vni_all_cmd);
 	install_element(VIEW_NODE, &show_evpn_mac_vni_cmd);
+	install_element(VIEW_NODE, &show_evpn_mac_evi_cmd);
 	install_element(VIEW_NODE, &show_evpn_mac_vni_all_cmd);
 	install_element(VIEW_NODE, &show_evpn_mac_vni_all_detail_cmd);
 	install_element(VIEW_NODE, &show_evpn_mac_vni_detail_cmd);
@@ -4431,6 +4452,7 @@ void zebra_vty_init(void)
 	install_element(VIEW_NODE, &show_evpn_mac_vni_dad_cmd);
 	install_element(VIEW_NODE, &show_evpn_mac_vni_all_dad_cmd);
 	install_element(VIEW_NODE, &show_evpn_neigh_vni_cmd);
+	install_element(VIEW_NODE, &show_evpn_neigh_evi_cmd);
 	install_element(VIEW_NODE, &show_evpn_neigh_vni_all_cmd);
 	install_element(VIEW_NODE, &show_evpn_neigh_vni_all_detail_cmd);
 	install_element(VIEW_NODE, &show_evpn_neigh_vni_neigh_cmd);
