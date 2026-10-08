@@ -21,6 +21,7 @@
 #include "zebra/ge_netlink.h"
 #include "zebra/interface.h"
 #include "zebra/zebra_trace.h"
+#include "zebra/zebra_srv6_sid_stats.h"
 #include "typesafe.h"
 
 #include <stdio.h>
@@ -3040,6 +3041,7 @@ void zebra_srv6_terminate(void)
 
 		list_delete(&g_srv6.sid_formats);
 	}
+	zebra_srv6_sid_stats_fini();
 }
 
 void zebra_srv6_init(void)
@@ -3058,6 +3060,7 @@ void zebra_srv6_init(void)
 
 	/* SRv6 L2 EVPN (VLAN-to-EVI) EVI table. */
 	zebra_srv6_l2evpn_init();
+	zebra_srv6_sid_stats_init();
 }
 
 bool zebra_srv6_is_enable(void)

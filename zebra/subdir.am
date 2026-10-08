@@ -118,6 +118,7 @@ zebra_zebra_SOURCES = \
 	zebra/zebra_neigh.c \
 	zebra/zserv.c \
 	zebra/zebra_srv6_vpws.c \
+	zebra/zebra_srv6_sid_stats.c \
 	# end
 
 clippy_scan += \
@@ -204,6 +205,7 @@ nobase_pkginclude_HEADERS += \
 	zebra/zebra_vxlan_if.h \
 	zebra/zserv.h \
 	zebra/zebra_srv6_vpws.h \
+	zebra/zebra_srv6_sid_stats.h \
 	# end
 
 noinst_HEADERS += \
