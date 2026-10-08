@@ -24,6 +24,7 @@
 #include "zebra/zebra_evpn.h"
 #include "zebra/zebra_evpn_mac.h"
 #include "zebra/zebra_evpn_neigh.h"
+#include "lib/zclient.h"
 #include "zebra/zebra_sr6.h"
 #include "zebra/zebra_dplane.h"
 #include "zebra/interface.h"
@@ -34,6 +35,7 @@
 #include "zebra/zebra_srv6.h"
 
 #include "lib/srv6.h"
+#include "lib/vrf.h"
 
 DEFINE_MTYPE_STATIC(ZEBRA, ZEBRA_SRV6_EVI, "SRv6 L2 EVPN EVI");
 DEFINE_MTYPE_STATIC(ZEBRA, ZEBRA_SRV6_EVI_BD, "SRv6 L2 EVPN EVI member BD");
@@ -127,6 +129,22 @@ static int srv6_dp_mac_install(struct zebra_evpn *zevpn, struct zebra_mac *mac, 
 	}
 
 	/*
+	 * Still no resolved oif: the sr6 netdev is genuinely still mid-create
+	 * (async-create window). dplane_rem_mac_add() below only takes the
+	 * correctly-built sticky/permanent netlink_sr6_macfdb_encode() path
+	 * when sr6_ifindex != 0 - with it still 0 here, mac_update_common()
+	 * would fall back to the generic FDB encoder with ifp == br_ifp (both
+	 * zevpn->bridge_if), i.e. a bridge-self-referencing FDB entry without
+	 * NTF_STICKY, which the kernel rejects outright ("bridge: FDB entry
+	 * towards bridge must be permanent") - and unlike a deferred install,
+	 * that failure is never retried. Bail out here instead: zebra_sr6_if_add()
+	 * re-realizes the EVI once the netdev's ifindex is known, which re-enters
+	 * this function with a resolved sr6_ifindex.
+	 */
+	if (mac->sr6_ifindex == 0)
+		return 0;
+
+	/*
 	 * Program the bridge FDB entry with the sr6 (End.DT2U) interface as the
 	 * egress, VLAN-scoped by zevpn->vid.  We pass the
 	 * EVI bridge as the ctx interface (for vrf/ns); the kernel provider
@@ -181,8 +199,9 @@ static int srv6_dp_flood(struct zebra_evpn *zevpn, void *arg)
 
 static struct interface *srv6_dp_bridge(struct zebra_evpn *zevpn)
 {
-	/* TODO(phase3): return the EVI's vlan-aware bridge_if. */
-	return NULL;
+	struct zebra_srv6_evi *evi = zebra_srv6_evi_lookup(zevpn->vni);
+
+	return evi ? evi->bridge_if : NULL;
 }
 
 const struct zevpn_dp_ops zevpn_dp_ops_srv6 = {
@@ -576,6 +595,17 @@ void zebra_srv6_evi_set_bridge(struct zebra_srv6_evi *evi, struct interface *bri
 	zebra_srv6_evi_realize(evi);
 }
 
+void zebra_srv6_evi_set_vrf(struct zebra_srv6_evi *evi, vrf_id_t vrf_id)
+{
+	if (!evi)
+		return;
+	if (evi->vrf_id == vrf_id)
+		return;
+	evi->vrf_id = vrf_id;
+	/* Re-realize so the VNI_ADD to bgpd carries the updated tenant_vrf_id. */
+	zebra_srv6_evi_realize(evi);
+}
+
 int zebra_srv6_evi_set_service(struct zebra_srv6_evi *evi, enum zevpn_l2_service svc)
 {
 	struct zebra_srv6_evi_bd *bd;
@@ -774,6 +804,41 @@ void zebra_srv6_l2evpn_realize_on_bridge(ifindex_t bridge_ifindex)
 			zebra_srv6_evi_realize(evi);
 }
 
+/*
+ * Interface-add notification from if_add_update() (see interface.c), mirroring
+ * zebra_srv6_vpws_if_add().  The operator may create the EVI's bridge AFTER the
+ * EVI is configured, or zebra may parse its config before the kernel interface
+ * dump arrives; in either case the `evi ... bridge <br>` command resolved
+ * bridge_if to NULL and realize() bailed ("not enough config yet").  Nothing
+ * else rebinds it: realize_on_bridge() matches EVIs by evi->bridge_if->ifindex,
+ * which is NULL for exactly these EVIs, so they would stay unrealized (no
+ * per-EVI DT2U/DT2M SID, no Type-2/Type-3, no L2 dataplane) until a full config
+ * re-apply.  When the named bridge finally appears, bind it and realize.
+ */
+void zebra_srv6_evi_if_add(struct interface *ifp)
+{
+	struct zebra_srv6_evi *evi;
+
+	if (!srv6_evi_inited || !ifp || ifp->ifindex == 0)
+		return;
+
+	frr_each_safe (srv6_evi_htab, srv6_evi_table, evi) {
+		if (evi->bridge_if)
+			continue; /* already bound */
+		if (evi->bridge_ifname[0] == '\0')
+			continue;
+		if (strncmp(evi->bridge_ifname, ifp->name,
+			    sizeof(evi->bridge_ifname)) != 0)
+			continue;
+
+		evi->bridge_if = ifp;
+		if (IS_ZEBRA_DEBUG_VXLAN)
+			zlog_debug("%s: EVI %u bridge %s (ifindex %u) appeared, realizing",
+				   __func__, evi->vni, ifp->name, ifp->ifindex);
+		zebra_srv6_evi_realize(evi);
+	}
+}
+
 void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 {
 	struct zebra_evpn *zevpn;
@@ -804,6 +869,10 @@ void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 	 */
 	zevpn->dp_ops = &zevpn_dp_ops_srv6;
 	zevpn->bridge_if = evi->bridge_if;
+	/* Propagate tenant VRF so bgpd's VNI_ADD carries the correct
+	 * tenant_vrf_id for symmetric IRB (bgpevpn_link_to_l3vni). */
+	if (evi->vrf_id != VRF_DEFAULT)
+		zevpn->vrf_id = evi->vrf_id;
 
 	/*
 	 * Allocate this EVI's own End.DT2U/End.DT2M service SIDs from its
@@ -908,6 +977,27 @@ void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 	 * own SID → loop.  The peer-keyed bum-sr6 remains the only flood port.
 	 * Keyed by the EVI's own DT2U SID (distinct from any remote SID).
 	 */
+	/*
+	 * Self-heal a stale decap oif: if the sr6 device backing it was ever
+	 * deleted out from under us (e.g. externally, or by anything else that
+	 * doesn't go through zebra_sr6_release()), local_decap_oif keeps
+	 * pointing at a now-nonexistent ifindex forever - "have_decap" below
+	 * keys off local_decap_sid, not the ifindex, so it would see the SID
+	 * as already held and never notice, leaving the EVI stuck advertising
+	 * a route to a dead interface (l2dev <unknown>, inactive) until an
+	 * operator removes and re-adds the whole EVI. Detect that here and
+	 * release + clear local_decap_sid so "!have_decap" below recreates it
+	 * on its own, same as any other sid_changed trigger already does.
+	 */
+	if (!IN6_IS_ADDR_UNSPECIFIED(&evi->local_decap_sid) && evi->local_decap_oif != 0 &&
+	    !if_lookup_by_index_per_ns(zebra_ns_lookup(NS_DEFAULT), evi->local_decap_oif)) {
+		zlog_warn("%s: EVI %u: local decap oif %u no longer exists; will recreate",
+			  __func__, evi->vni, evi->local_decap_oif);
+		zebra_sr6_release(&evi->local_decap_sid);
+		memset(&evi->local_decap_sid, 0, sizeof(evi->local_decap_sid));
+		evi->local_decap_oif = 0;
+	}
+
 	if (evi->dt2u_sid_valid) {
 		bool have_decap = !IN6_IS_ADDR_UNSPECIFIED(&evi->local_decap_sid);
 		bool sid_changed = have_decap &&
@@ -997,33 +1087,119 @@ void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 		zebra_sr6_bind_vlan_on_bridge(evi->bridge_if->ifindex, zevpn->vid);
 
 	/*
+	 * The bridge device's OWN self-VLAN/PVID must also match the EVI's
+	 * VLAN, distinct from the per-port bind above. When VRF-routed IRB
+	 * traffic is delivered directly to this bridge device (VRF route
+	 * resolves to a local, directly-connected subnet on this bridge),
+	 * the kernel's br_dev_xmit() has no ingress port to derive a VLAN
+	 * from and falls back to the bridge's own default self-PVID (VLAN
+	 * 1) for its FDB lookup. Since every real FDB entry on a
+	 * vlan-filtering bridge is tagged with the EVI's actual VLAN, that
+	 * mismatched lookup key misses unconditionally -- regardless of
+	 * whether the destination MAC is genuinely known -- and falls back
+	 * to flooding, which leaks the packet out the fabric-facing BUM
+	 * port to every other PE even though it was already correctly
+	 * routed to this one. Setting the bridge's own self-PVID to the
+	 * EVI's VLAN here closes that gap the same way the per-port bind
+	 * above already does for the tunnel ports.
+	 *
+	 * Gate on self_pvid_bound_vid (mirrors kernel_state_rescan_bridge_ifindex
+	 * below): realize() runs on every remote MAC install, not just on an
+	 * actual VLAN change, and re-issuing this RTM_SETLINK on every one of
+	 * those redundant passes races the kernel's bridge VLAN reprogramming
+	 * against the remote-MAC FDB add already in flight on the same dplane
+	 * FIFO for the very MAC that triggered this realize() pass -
+	 * intermittently dropping that install. Re-apply only when the vid
+	 * actually changes (or on the first realize); no-op for vlan-bundle
+	 * (vid 0).
+	 */
+	if (zevpn->vid && evi->self_pvid_bound_vid != zevpn->vid) {
+		dplane_sr6_bridge_vlan_add(evi->bridge_if->ifindex, zevpn->vid,
+					    true /* untagged */, true /* pvid */,
+					    true /* self */);
+		/*
+		 * Setting VLAN 400 as the new self-PVID demotes the bridge's
+		 * default VLAN 1 from PVID, but leaves it registered as a
+		 * second, still-untagged self-membership. With two untagged
+		 * VLAN contexts on the bridge's own self-entry, a locally
+		 * generated broadcast (e.g. this EVI's anycast IRB gateway
+		 * answering its own ARP request) gets delivered to the local
+		 * stack once per VLAN - a spurious duplicate reply. Strip
+		 * the stale VLAN 1 self-membership alongside binding VLAN
+		 * 400, mirroring the per-port cleanup above.
+		 */
+		if (zevpn->vid != 1)
+			dplane_sr6_bridge_vlan_del(evi->bridge_if->ifindex, 1, true /* self */);
+		evi->self_pvid_bound_vid = zevpn->vid;
+	}
+
+	/*
 	 * Re-program remote SRv6 MAC FDB entries now that vid is resolved and
 	 * the egress sr6 ports are VLAN-bound.  A remote MAC received during
 	 * the earlier vid-0 window was filed under vid 0 (or rejected, because
 	 * its egress sr6 wasn't yet a member of the EVI VLAN); re-issuing here
 	 * lands it on the correct VLAN so unicast to the peer works.
 	 */
-	if (zevpn->vid)
-		zebra_evpn_rem_srv6_macs_reinstall(zevpn);
+	/*
+	 * Ungated: vlan-bundle runs at vid 0 and still needs its deferred remote
+	 * MAC FDB entries programmed.  Gating this on zevpn->vid skipped the
+	 * reinstall entirely for vlan-bundle EVIs, so remote Type-2 MACs received
+	 * during the async sr6-create window were never installed in the kernel
+	 * FDB.  (The PVID bind above stays vid-gated; it is a no-op at vid 0.)
+	 */
+	zebra_evpn_rem_srv6_macs_reinstall(zevpn);
 
 	SET_FLAG(zevpn->flags, ZEVPN_READY_FOR_BGP);
 	zebra_evpn_send_add_to_client(zevpn);
 
+	/* RFC 9135 section 9: Anycast Gateway advertisement.
+	 * For IRB-enabled EVIs (VRF binding present), (re)register the bridge
+	 * SVI MAC+IP as the local gateway entry so it's ready to advertise as
+	 * a sticky Default GW Type-2 route.  Whether it actually gets sent to
+	 * bgpd is gated by the existing advertise-default-gw knob (checked via
+	 * advertise_gw_macip_enabled() inside zebra_evpn_{mac,neigh}_gw_macip_add()) -
+	 * same knob/CLI/ZAPI plumbing already used by the VXLAN path, so it is
+	 * NOT force-enabled here.  This allows remote PEs to suppress ARP/ND
+	 * for the gateway IP and enables seamless CE mobility without
+	 * re-ARPing, when the operator has opted in.  The MACIP send is
+	 * idempotent -- it overwrites any stale entry with fresh SID-embedded
+	 * attributes. */
+	if (evi->vrf_id != VRF_DEFAULT && evi->bridge_if)
+		zebra_srv6_evpn_gw_macip_add(evi->bridge_if, zevpn);
+
 	/*
-	 * Re-scan the kernel bridge FDB for this EVI's bridge + VLAN so local
-	 * MACs already present in the kernel are originated as Type-2.  Local
-	 * MACs (static FDB entries, or MACs learned before an EVI delete/re-add)
-	 * emit their RTM_NEWNEIGH only once — on a re-add zebra never sees them
-	 * again, so without this rescan a re-added SRv6 EVI never advertises
-	 * its pre-existing local MACs (and peers never build the unicast sr6).
-	 * Mirrors the VXLAN VNI-up path (zebra_evpn_read_mac_neigh).  vid 0
-	 * (vlan-bundle) means no VLAN filter — read the whole bridge FDB.
+	 * Re-scan the kernel bridge FDB *and* neighbor table for this EVI's
+	 * bridge + VLAN so local MACs and ARP/ND entries already present in
+	 * the kernel are (re-)originated as Type-2. Both emit their
+	 * RTM_NEWNEIGH only once -- on zebra restart, or an EVI delete/re-add,
+	 * zebra never sees an already-established kernel entry again, so
+	 * without this rescan a (re-)realized SRv6 EVI silently drops any
+	 * pre-existing local host's MAC+IP route (the plain MAC-only route
+	 * still gets re-learned once new traffic arrives, masking this as a
+	 * "partial" loss rather than the missing neighbor rescan it is).
+	 * Mirrors the VXLAN VNI-up path (zebra_evpn_read_mac_neigh(), which
+	 * calls both dplane_fdb_read_for_bridge() and
+	 * dplane_neigh_read_for_vlan() together) - this EVI-realize path only
+	 * ever had the FDB half. vid 0 (vlan-bundle) means no VLAN filter -
+	 * read the whole bridge FDB. The EVI's bridge itself (not a separate
+	 * VLAN sub-interface) is where the SVI IP/ARP lives here, so it is
+	 * also the neighbor-read's "vlan interface".
+	 *
+	 * realize() itself runs far more often than the bridge actually
+	 * changes (every remote MAC install, VLAN repair, interface-add hook,
+	 * ...); re-issuing a full kernel FDB+neighbor dump request on every
+	 * one of those redundant calls floods the dataplane instead of
+	 * helping, so only do this once per bridge (tracked by ifindex, reset
+	 * whenever the bridge actually changes).
 	 */
-	{
+	if (evi->kernel_state_rescan_bridge_ifindex != evi->bridge_if->ifindex) {
 		struct zebra_ns *zns = zebra_ns_lookup(NS_DEFAULT);
 
-		if (zns)
+		if (zns) {
 			dplane_fdb_read_for_bridge(zns, evi->bridge_if, evi->bridge_if, zevpn->vid);
+			dplane_neigh_read_for_vlan(zns, evi->bridge_if);
+			evi->kernel_state_rescan_bridge_ifindex = evi->bridge_if->ifindex;
+		}
 	}
 
 	if (IS_ZEBRA_DEBUG_VXLAN)
@@ -1084,6 +1260,24 @@ vni_t zebra_srv6_evi_vni_by_bridge_vlan(const struct interface *br_if, vlanid_t 
 	return found;
 }
 
+/* Find the first SRv6 EVI whose bridge_if matches br_if.
+ * Used by zebra_evpn_from_svi() to resolve ARP/ND events on SRv6 bridges. */
+struct zebra_srv6_evi *
+zebra_srv6_evi_find_by_bridge(const struct interface *br_if)
+{
+	struct zebra_srv6_evi *evi;
+
+	if (!br_if)
+		return NULL;
+
+	frr_each (srv6_evi_htab, srv6_evi_table, evi) {
+		if (evi->bridge_if == br_if)
+			return evi;
+	}
+
+	return NULL;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Replay all SRv6 EVIs to BGP                                                  */
 /* -------------------------------------------------------------------------- */
@@ -1103,8 +1297,23 @@ void zebra_srv6_l2evpn_replay(void)
 	if (!srv6_evi_inited)
 		return;
 
-	frr_each_safe (srv6_evi_htab, srv6_evi_table, evi)
+	frr_each_safe (srv6_evi_htab, srv6_evi_table, evi) {
+		/*
+		 * Force the kernel FDB/neighbor rescan inside realize() below,
+		 * even though this bridge may already have been rescanned once
+		 * before. This replay path runs specifically when bgpd
+		 * (re)enables advertise-all-vni - most commonly after a
+		 * bgpd-only restart while zebra keeps running - and existing
+		 * local MACs/neighbors need to be re-originated as Type-2 to
+		 * the newly (re)connected bgp client even though zebra's own
+		 * bridge state never changed. The per-bridge gate in realize()
+		 * only knows how to suppress *its own* redundant calls; it has
+		 * no way to tell that the client on the other end just lost
+		 * all of its EVPN state.
+		 */
+		evi->kernel_state_rescan_bridge_ifindex = 0;
 		zebra_srv6_evi_realize(evi);
+	}
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1317,9 +1526,26 @@ int zebra_srv6_l2evpn_config_write(struct vty *vty)
 				zebra_sr6_encap_mode2str(evi->l2_encap_mode));
 		frr_each (evi_bds, &evi->bds, bd)
 			vty_out(vty, "    vlan %u\n", bd->vid);
-		vty_out(vty, "   exit\n");
+		if (evi->vrf_id != VRF_DEFAULT)
+			vty_out(vty, "    vrf %s\n", vrf_id_to_name(evi->vrf_id));
+		/*
+		 * Close with "!", not "exit" - "exit" is a generic command
+		 * available at virtually every vty node (including the
+		 * top-level CONFIG_NODE). In a shared/integrated frr.conf, a
+		 * foreign daemon (bgpd, isisd) that doesn't recognize this
+		 * EVI block's enclosing commands stays parked at CONFIG_NODE
+		 * while skipping each unrecognized line; the bare "exit" then
+		 * matches CONFIG_NODE's own exit command, which pops out of
+		 * config mode entirely and aborts the rest of the file read
+		 * for that daemon (see vty_config_node_exit() in lib/vty.c).
+		 * "!" is always a no-op comment, so it's silently skipped by
+		 * every daemon regardless of node state - matching the
+		 * existing convention used by the sibling locators/locator
+		 * blocks in this same file.
+		 */
+		vty_out(vty, "   !\n");
 	}
-	vty_out(vty, "  exit\n");
+	vty_out(vty, "  !\n");
 	return 0;
 }
 
@@ -1348,4 +1574,40 @@ void zebra_srv6_l2evpn_terminate(void)
 	}
 	srv6_evi_htab_fini(srv6_evi_table);
 	srv6_evi_inited = false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Lab helper: inject static neighbor into EVPN table                         */
+/* -------------------------------------------------------------------------- */
+
+void zebra_srv6_evi_static_neigh_inject(struct zebra_evpn *zevpn,
+					struct interface *ifp,
+					struct ipaddr *ip,
+					struct ethaddr *mac)
+{
+	struct zebra_mac *zmac;
+
+	/* Install in kernel ARP table (inside the PE namespace via dplane) */
+	dplane_local_neigh_add(ifp, ip, mac, false, true, false);
+
+	/* Try the normal neighbor update path (installs in EVPN neigh table). */
+	zebra_evpn_local_neigh_update(zevpn, ifp, ip, mac,
+				      false /* is_router */,
+				      false /* local_inactive */,
+				      true /* dp_static */);
+
+	/* For SRv6 EVIs, zebra_evpn_local_neigh_update() may return success
+	 * but silently skip the bgpd notification (no vxlan_if path).
+	 * Always send MACIP ADD directly so bgpd builds the Type-2 route. */
+	zmac = zebra_evpn_mac_lookup(zevpn, mac);
+	if (zmac && CHECK_FLAG(zmac->flags, ZEBRA_MAC_LOCAL)) {
+		zebra_evpn_macip_send_msg_to_client(zevpn->vni, mac, ip,
+						    0 /* flags */, 0 /* seq */,
+						    ZEBRA_NEIGH_ACTIVE,
+						    NULL /* es */,
+						    ZEBRA_MACIP_ADD);
+	} else {
+		zlog_warn("srv6 static-neigh: no local MAC %pEA in VNI %u -- skipping bgpd notify",
+			  mac, zevpn->vni);
+	}
 }

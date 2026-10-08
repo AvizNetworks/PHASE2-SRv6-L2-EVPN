@@ -1845,6 +1845,19 @@ DEFUNSH(VTYSH_ZEBRA, srv6_l2evpn_evi, srv6_l2evpn_evi_cmd,
 	return CMD_SUCCESS;
 }
 
+DEFUNSH(VTYSH_ZEBRA, srv6_evi_static_neigh, srv6_evi_static_neigh_cmd,
+	"srv6 evi (0-16777215) static-neigh A.B.C.D mac WORD",
+	"SRv6\n"
+	"EVI\n"
+	"VNI number\n"
+	"Add static neighbor (ARP) entry for MAC+IP Type-2 advertisement\n"
+	"CE IP address\n"
+	"MAC address keyword\n"
+	"CE MAC address\n")
+{
+	return CMD_SUCCESS;
+}
+
 #ifdef HAVE_BGPD
 DEFUNSH(VTYSH_BGPD, router_bgp, router_bgp_cmd,
 	"router bgp [ASNUM [<view|vrf> VIEWVRFNAME] [as-notation <dot|dot+|plain>]]",
@@ -6058,6 +6071,7 @@ void vtysh_init_vty(void)
 
 	/* debugging */
 	install_element(VIEW_NODE, &vtysh_show_error_code_cmd);
+	install_element(ENABLE_NODE, &srv6_evi_static_neigh_cmd);
 	install_element(ENABLE_NODE, &vtysh_show_debugging_cmd);
 	install_element(ENABLE_NODE, &vtysh_show_debugging_hashtable_cmd);
 	install_element(ENABLE_NODE, &vtysh_debug_all_cmd);

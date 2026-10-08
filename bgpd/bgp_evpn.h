@@ -39,49 +39,14 @@ static inline int is_evpn_enabled(void)
 	return bgp ? EVPN_ENABLED(bgp) : 0;
 }
 
-static inline int advertise_type5_routes_bestpath(const struct bgp *bgp_vrf, afi_t afi, safi_t safi)
-{
-	uint16_t flags = bgp_vrf->af_flags[AFI_L2VPN][SAFI_EVPN];
-
-	if (safi == SAFI_MPLS_VPN) {
-		if (afi == AFI_IP && CHECK_FLAG(flags, BGP_L2VPN_EVPN_ADV_IPV4_VPN))
-			return 1;
-
-		if (afi == AFI_IP6 && CHECK_FLAG(flags, BGP_L2VPN_EVPN_ADV_IPV6_VPN))
-			return 1;
-
-		return 0;
-	}
-
-	if (!bgp_vrf->l3vni)
-		return 0;
-
-	if (afi == AFI_IP && CHECK_FLAG(flags, BGP_L2VPN_EVPN_ADV_IPV4_UNICAST))
-		return 1;
-	if (afi == AFI_IP6 && CHECK_FLAG(flags, BGP_L2VPN_EVPN_ADV_IPV6_UNICAST))
-		return 1;
-
-	return 0;
-}
-
-static inline int advertise_type5_routes_multipath(const struct bgp *bgp_vrf, afi_t afi,
-						   safi_t safi)
-{
-	uint16_t flags = bgp_vrf->af_flags[AFI_L2VPN][SAFI_EVPN];
-
-	if (safi == SAFI_MPLS_VPN)
-		return 0;
-
-	if (!bgp_vrf->l3vni)
-		return 0;
-
-	if (afi == AFI_IP && CHECK_FLAG(flags, BGP_L2VPN_EVPN_ADV_IPV4_UNICAST_GW_IP))
-		return 1;
-	if (afi == AFI_IP6 && CHECK_FLAG(flags, BGP_L2VPN_EVPN_ADV_IPV6_UNICAST_GW_IP))
-		return 1;
-
-	return 0;
-}
+/*
+ * Whether this VRF has any live encapsulation to originate Type-5 routes
+ * over -- either a VXLAN L3VNI or an SRv6 DT46 SID.  Defined in bgp_evpn.c
+ * (not here) since checking the SRv6 case requires bgp_evpn_private.h,
+ * which is intentionally not included from this public header.
+ */
+extern int advertise_type5_routes_bestpath(const struct bgp *bgp_vrf, afi_t afi, safi_t safi);
+extern int advertise_type5_routes_multipath(const struct bgp *bgp_vrf, afi_t afi, safi_t safi);
 
 static inline bool bgp_evpn_suppress_import_from_evpn(struct bgp *bgp_vrf, afi_t afi)
 {
@@ -177,6 +142,7 @@ extern void bgp_evpn_advertise_type5_routes(struct bgp *bgp_vrf, afi_t afi,
 					    safi_t safi);
 extern void bgp_evpn_vrf_delete(struct bgp *bgp_vrf);
 extern void bgp_evpn_handle_router_id_update(struct bgp *bgp, int withdraw);
+extern int bgp_evpn_handle_peer_established(struct peer *peer);
 /* Per-EVI End.DT2U/End.DT2M SID table for `show bgp segment-routing srv6
  * evpn` (defined in bgp_evpn_vty.c; needs private bgpevpn internals).
  */
@@ -238,6 +204,7 @@ extern void bgp_evpn_init(struct bgp *bgp);
 extern int bgp_evpn_get_type5_prefixlen(const struct prefix *pfx);
 extern bool bgp_evpn_is_prefix_nht_supported(const struct prefix *pfx);
 extern void update_advertise_vrf_routes(struct bgp *bgp_vrf);
+extern void bgp_evpn_handle_export_rt_change_for_vrf(struct bgp *bgp_vrf);
 extern void bgp_evpn_show_remote_ip_hash(struct hash_bucket *bucket,
 					 void *args);
 extern void bgp_evpn_show_vni_svi_hash(struct hash_bucket *bucket, void *args);
@@ -287,6 +254,8 @@ int uninstall_evpn_route_entry_in_vrf(struct bgp *bgp_vrf, const struct prefix_e
 				      struct bgp_path_info *parent_pi);
 extern void bgp_zebra_evpn_pop_items_from_announce_fifo(struct bgpevpn *vpn);
 extern int install_uninstall_routes_for_vni(struct bgp *bgp, struct bgpevpn *vpn, bool install);
+extern void bgp_evpn_install_routes_in_vrf(struct bgp *bgp_vrf);
+extern void bgp_evpn_link_l2vnis_to_vrf(struct bgp *bgp_vrf);
 extern void bgp_evpn_fill_rmac_nh_to_attr(struct bgp *bgp_vrf, struct attr *attr,
 					  struct prefix_evpn *evp, struct ipaddr *vtep_ip);
 #endif /* _QUAGGA_BGP_EVPN_H */

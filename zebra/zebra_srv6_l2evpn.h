@@ -147,6 +147,14 @@ struct zebra_srv6_evi {
 	/* SRv6 backend anchor (unused for the VXLAN backend) */
 	char locator[SRV6_L2EVPN_LOCNAME_SIZE];
 	struct interface *bridge_if; /* VLAN-aware (vlan_filtering) bridge */
+	/*
+	 * Configured bridge name.  The operator may create the bridge AFTER the
+	 * EVI is configured, or zebra may parse its config before the kernel
+	 * interface dump arrives, so bridge_if can be NULL at config time.  Keep
+	 * the name so zebra_srv6_evi_if_add() can bind + realize when the
+	 * interface appears (mirrors VPWS v->bridge_ifname).
+	 */
+	char bridge_ifname[IFNAMSIZ];
 	struct in6_addr dt2u_sid;    /* per-EVI unicast SID */
 	struct in6_addr dt2m_sid;    /* per-EVI BUM SID */
 	bool dt2u_sid_valid;
@@ -168,6 +176,25 @@ struct zebra_srv6_evi {
 	 * never installs the new End.DT2U/DT2M decap.
 	 */
 	struct in6_addr local_decap_sid;
+
+	vrf_id_t vrf_id; /* tenant VRF (VRF_DEFAULT = unset) */
+
+	/*
+	 * Bridge ifindex the kernel FDB/neighbor-table rescan (in realize())
+	 * last ran against.  realize() can run many times per second; the
+	 * rescan only needs to happen once after the bridge actually changes.
+	 * 0 means "never rescanned yet for the current bridge".
+	 */
+	ifindex_t kernel_state_rescan_bridge_ifindex;
+
+	/*
+	 * The VLAN the bridge device's own self-PVID was last bound to (see the
+	 * self-PVID bind in realize()).  Re-issuing the self-PVID RTM_SETLINK on
+	 * every redundant realize() races the kernel's bridge VLAN reprogramming
+	 * against in-flight FDB adds, intermittently dropping an install.  0 =
+	 * not yet bound for the current vid.
+	 */
+	vlanid_t self_pvid_bound_vid;
 
 	/* Operator-owned sr6 (End.DT2U) / bum-sr6 (End.DT2M) interfaces for this
 	 * EVI's bridge, discovered by name prefix; 0 until discovered.
@@ -205,6 +232,7 @@ extern struct zebra_srv6_evi_bd *zebra_srv6_evi_vlan_find(struct zebra_srv6_evi 
 extern void zebra_srv6_evi_set_locator(struct zebra_srv6_evi *evi, const char *locator);
 extern void zebra_srv6_evi_set_bridge(struct zebra_srv6_evi *evi, struct interface *bridge_if);
 extern int zebra_srv6_evi_set_service(struct zebra_srv6_evi *evi, enum zevpn_l2_service svc);
+extern void zebra_srv6_evi_set_vrf(struct zebra_srv6_evi *evi, vrf_id_t vrf_id);
 
 /*
  * Materialize the per-EVI zebra_evpn (SRv6 backend) and announce to BGP.
@@ -212,6 +240,7 @@ extern int zebra_srv6_evi_set_service(struct zebra_srv6_evi *evi, enum zevpn_l2_
  */
 extern void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi);
 void zebra_srv6_l2evpn_realize_on_bridge(ifindex_t bridge_ifindex);
+void zebra_srv6_evi_if_add(struct interface *ifp);
 
 /*
  * Handle a remote VTEP/peer BUM (Type-3) update for an SRv6 EVI: create /
@@ -242,11 +271,19 @@ extern void zebra_srv6_evi_set_encap_mode(struct zebra_srv6_evi *evi, uint8_t mo
 /* Configured encap mode of the EVI bound to @bridge_ifindex; FULL if none. */
 extern uint8_t zebra_srv6_evi_encap_mode_by_bridge(ifindex_t bridge_ifindex);
 
+/* Find the SRv6 EVI whose bridge_if matches br_if; NULL if none. */
+extern struct zebra_srv6_evi *
+zebra_srv6_evi_find_by_bridge(const struct interface *br_if);
+
 extern const char *zevpn_l2_service2str(enum zevpn_l2_service svc);
 extern int zevpn_l2_service_str2enum(const char *s, enum zevpn_l2_service *out);
 
 /* config-write hook for the `l2-evpn` block (called from zebra_srv6_vty.c) */
 extern int zebra_srv6_l2evpn_config_write(struct vty *vty);
+extern void zebra_srv6_evi_static_neigh_inject(struct zebra_evpn *zevpn,
+					       struct interface *ifp,
+					       struct ipaddr *ip,
+					       struct ethaddr *mac);
 
 #ifdef __cplusplus
 }

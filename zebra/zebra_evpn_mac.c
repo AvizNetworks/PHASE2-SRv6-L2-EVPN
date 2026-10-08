@@ -2260,6 +2260,38 @@ int zebra_evpn_mac_remote_macip_add(struct zebra_evpn *zevpn, struct zebra_vrf *
 						   sizeof(mac_buf)));
 			}
 
+			/*
+			 * The kernel bridge learned this MAC dynamically on
+			 * mac->ifp before it moved. Nothing below tells the
+			 * kernel to forget that entry - it just sits there
+			 * until the bridge's own ageing timer (default 300s)
+			 * expires it, so the dataplane keeps a stale local
+			 * FDB entry alongside the new remote one for up to
+			 * five minutes after a MAC mobility event, even
+			 * though zebra and BGP have already fully converged
+			 * on "remote". Flush it proactively instead of
+			 * waiting on ageing.
+			 */
+			if (mac->ifp) {
+				struct interface *br_ifp;
+				vlanid_t vid;
+
+				if (zevpn->vxlan_if) {
+					struct zebra_if *zif = zevpn->vxlan_if->info;
+					struct zebra_vxlan_vni *vni;
+
+					br_ifp = zif->brslave_info.br_if;
+					vni = zebra_vxlan_if_vni_find(zif, zevpn->vni);
+					vid = vni ? vni->access_vlan : 0;
+				} else {
+					br_ifp = zevpn->bridge_if;
+					vid = zevpn->vid;
+				}
+
+				if (br_ifp)
+					dplane_local_mac_del(mac->ifp, br_ifp, vid, macaddr);
+			}
+
 			zebra_evpn_mac_clear_sync_info(mac);
 			zebra_evpn_mac_send_del_to_client(zevpn->vni, macaddr,
 							  mac->flags, false);
@@ -2354,6 +2386,78 @@ int zebra_evpn_add_update_local_mac(struct zebra_vrf *zvrf,
 	/* Check if we need to create or update or it is a NO-OP. */
 	if (!mac)
 		mac = zebra_evpn_mac_lookup(zevpn, macaddr);
+
+	/*
+	 * A local MAC is about to be (re)established on this exact access
+	 * port+VLAN. If some *other* MAC is still marked local on this same
+	 * port+VLAN, the port's identity changed (e.g. a CE's interface was
+	 * given a new MAC without the kernel ever seeing an explicit
+	 * departure to key a delete off of - no link down/up, no more
+	 * traffic from the old address, nothing). This has to run
+	 * regardless of whether "mac" (the one being processed below) is
+	 * brand-new or already known to zebra as something else (e.g.
+	 * still remote from before it moved onto this port) - either way,
+	 * the other, different MAC on this port is now orphaned. Left
+	 * alone it sits as a stale local FDB entry (and a stale Type-2
+	 * route advertised to every peer) until the bridge's own ageing
+	 * timer eventually clears it - the same class of gap as the
+	 * local->remote mobility flush elsewhere in this file, but for the
+	 * case where the old MAC never reappears anywhere as remote either,
+	 * so BGP never has a reason to withdraw it on its own.
+	 * Point-to-point access ports carry exactly one CE's MAC, so a
+	 * second distinct local MAC here is always a replacement, not two
+	 * genuine hosts sharing the port.
+	 */
+	if (ifp->info) {
+		struct zebra_if *port_zif = ifp->info;
+		struct listnode *ln;
+		struct zebra_mac *stale_mac;
+
+		if (port_zif->mac_list) {
+			for (ALL_LIST_ELEMENTS_RO(port_zif->mac_list, ln, stale_mac)) {
+				struct interface *stale_ifp;
+				vlanid_t stale_vid;
+
+				if (!CHECK_FLAG(stale_mac->flags, ZEBRA_MAC_LOCAL))
+					continue;
+				if (memcmp(&stale_mac->macaddr, macaddr, sizeof(*macaddr)) == 0)
+					continue;
+
+				zebra_evpn_mac_get_access_info(stale_mac, &stale_ifp,
+								&stale_vid);
+				if (stale_ifp != ifp || stale_vid != vid)
+					continue;
+
+				if (IS_ZEBRA_DEBUG_VXLAN || IS_ZEBRA_DEBUG_EVPN_MH_MAC)
+					zlog_debug("        %pEA orphaned by new local MAC %pEA on same intf %s(%u) VID %u - flushing",
+						   &stale_mac->macaddr, macaddr, ifp->name,
+						   ifp->ifindex, vid);
+
+				{
+					struct interface *br_ifp;
+
+					if (zevpn->vxlan_if) {
+						struct zebra_if *vxlan_zif = zevpn->vxlan_if->info;
+
+						br_ifp = vxlan_zif->brslave_info.br_if;
+					} else {
+						br_ifp = zevpn->bridge_if;
+					}
+
+					if (br_ifp)
+						dplane_local_mac_del(ifp, br_ifp, vid,
+								     &stale_mac->macaddr);
+				}
+				zebra_evpn_del_local_mac(zevpn, stale_mac, false);
+				/* del may have unlinked/freed stale_mac and mutated
+				 * port_zif->mac_list - stop here rather than continue
+				 * iterating it.
+				 */
+				break;
+			}
+		}
+	}
+
 	if (!mac) {
 		if (IS_ZEBRA_DEBUG_VXLAN || IS_ZEBRA_DEBUG_EVPN_MH_MAC)
 			zlog_debug("ADD %sMAC %pEA intf %s(%u) VID %u -> VNI %u%s",
