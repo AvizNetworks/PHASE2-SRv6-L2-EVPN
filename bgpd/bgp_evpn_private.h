@@ -222,6 +222,21 @@ static inline bool is_vpn_vlan_bundle(const struct bgpevpn *vpn)
 	return vpn && vpn->srv6_svc_type == BGP_EVPN_SVC_VLAN_BUNDLE;
 }
 
+/*
+ * True when zebra has actually reported this VNI as a live SRv6 L2 EVPN EVI
+ * (a locator bound, or a DT2U/DT2M SID allocated), as opposed to a plain
+ * VXLAN VNI.  This is the authoritative "is this really an EVI" signal for
+ * display purposes - unlike VNI_FLAG_EVI, which only records which CLI
+ * keyword ('vni' vs 'evi') the operator happened to type when configuring
+ * this VNI's RT/RD under 'router bgp ... l2vpn evpn', and can therefore be
+ * unset even for a VNI that zebra is actively running as an SRv6 EVI.
+ */
+static inline bool bgp_evpn_vpn_is_evi(const struct bgpevpn *vpn)
+{
+	return vpn && (vpn->srv6_locator_name[0] != '\0' || vpn->srv6_dt2u_sid_valid ||
+		       vpn->srv6_dt2m_sid_valid);
+}
+
 /* Mapping of a fully qualified Import RT to VNIs.
  * The fully qualified import RTs of all VNIs are maintained in a hash
  * table with each RT linking to all VNIs that will import routes

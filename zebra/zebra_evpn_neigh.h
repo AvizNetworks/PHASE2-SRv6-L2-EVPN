@@ -297,7 +297,7 @@ void zebra_evpn_clear_dup_neigh_hash(struct zebra_evpn *zevpn, struct zebra_neig
 void zebra_evpn_print_neigh(const struct zebra_neigh *n, void *ctxt, json_object *json);
 void zebra_evpn_print_neigh_hash(struct neigh_walk_ctx *ctx, const struct zebra_neigh *n,
 				 int addr_width, int r_vtep_width);
-void zebra_evpn_print_neigh_hdr(struct vty *vty, int addr_width, int r_vtep_width);
+void zebra_evpn_print_neigh_hdr(struct vty *vty, int addr_width, int r_vtep_width, bool is_evi);
 void zebra_evpn_print_neigh_hash_detail(struct neigh_walk_ctx *ctx, const struct zebra_neigh *n);
 void zebra_evpn_print_dad_neigh_hash(struct neigh_walk_ctx *ctx, const struct zebra_neigh *n,
 				     int addr_width, int r_vtep_width);

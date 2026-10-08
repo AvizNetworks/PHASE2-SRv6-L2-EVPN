@@ -1964,11 +1964,12 @@ void zebra_evpn_print_neigh(const struct zebra_neigh *n, void *ctxt, json_object
 	}
 }
 
-void zebra_evpn_print_neigh_hdr(struct vty *vty, int addr_width, int r_vtep_width)
+void zebra_evpn_print_neigh_hdr(struct vty *vty, int addr_width, int r_vtep_width, bool is_evi)
 {
 	vty_out(vty, "Flags: I=local-inactive, P=peer-active, X=peer-proxy\n");
 	vty_out(vty, "%*s %-6s %-5s %-8s %-17s %*s %s\n", -addr_width, "Neighbor", "Type", "Flags",
-		"State", "MAC", -r_vtep_width, "Remote ES/VTEP", "Seq #'s");
+		"State", "MAC", -r_vtep_width, is_evi ? "Remote ES/PE" : "Remote ES/VTEP",
+		"Seq #'s");
 }
 
 static char *zebra_evpn_print_neigh_flags(const struct zebra_neigh *n, char *flags_buf,
@@ -2045,7 +2046,9 @@ void zebra_evpn_print_neigh_hash(struct neigh_walk_ctx *wctx, const struct zebra
 		if (json_evpn == NULL) {
 			if ((wctx->flags & SHOW_REMOTE_NEIGH_FROM_VTEP)
 			    && (wctx->count == 0))
-				zebra_evpn_print_neigh_hdr(vty, addr_width, r_vtep_width);
+				zebra_evpn_print_neigh_hdr(
+					vty, addr_width, r_vtep_width,
+					zebra_srv6_evi_lookup(wctx->zevpn->vni) != NULL);
 
 			if (!n->mac || n->mac->es == NULL)
 				ipaddr2str(&n->r_vtep_ip, addr_buf, sizeof(addr_buf));
