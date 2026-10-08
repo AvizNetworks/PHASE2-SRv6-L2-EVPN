@@ -32,6 +32,7 @@
 #include "zebra/zebra_dplane.h"
 
 #include "zebra/zebra_srv6_vty_clippy.c"
+#include "zebra/zebra_srv6_sid_stats.h"
 
 static int zebra_sr_config(struct vty *vty);
 
@@ -726,6 +727,100 @@ static void do_show_srv6_sid_all(struct vty *vty, json_object **json, struct srv
 		XFREE(MTYPE_TMP_TTABLE, table);
 		ttable_del(tt);
 	}
+}
+
+struct srv6_sid_stat_show {
+       struct vty *vty;
+       struct json_object *json;
+       const struct in6_addr *filter;
+};
+
+static uint64_t stat_delta(uint64_t cur, uint64_t base)
+{
+	return cur >= base ? cur - base : cur;
+}
+
+static void srv6_sid_stat_show_one(const struct zebra_srv6_sid_stat *e, void *arg)
+{
+       struct srv6_sid_stat_show *c = arg;
+       char sidbuf[INET6_ADDRSTRLEN];
+       const char *role = (e->is_local && e->is_encap) ? "local+encap"
+                          : e->is_local                ? "local-decap"
+                                                       : "remote-encap";
+
+       if (c->filter && memcmp(&e->sid, c->filter, sizeof(e->sid)) != 0)
+               return;
+
+       inet_ntop(AF_INET6, &e->sid, sidbuf, sizeof(sidbuf));
+
+       if (c->json) {
+               struct json_object *j = json_object_new_object();
+
+               json_object_string_add(j, "sid", sidbuf);
+               json_object_string_add(j, "role", role);
+               json_object_boolean_add(j, "local", e->is_local);
+               json_object_boolean_add(j, "encap", e->is_encap);
+               json_object_int_add(j, "behavior", e->k_action);
+               json_object_int_add(j, "rxPackets", stat_delta(e->rx_pkts, e->rx_pkts_base));
+               json_object_int_add(j, "rxBytes", stat_delta(e->rx_bytes, e->rx_bytes_base));
+               json_object_int_add(j, "txPackets", stat_delta(e->tx_pkts, e->tx_pkts_base));
+               json_object_int_add(j, "txBytes", stat_delta(e->tx_bytes, e->tx_bytes_base));
+               json_object_object_add(c->json, sidbuf, j);
+       } else {
+               vty_out(c->vty, "%-32s %-12s %12llu %14llu %12llu %14llu\n", sidbuf, role,
+                       (unsigned long long)stat_delta(e->rx_pkts, e->rx_pkts_base),
+                       (unsigned long long)stat_delta(e->rx_bytes, e->rx_bytes_base),
+                       (unsigned long long)stat_delta(e->tx_pkts, e->tx_pkts_base),
+                       (unsigned long long)stat_delta(e->tx_bytes, e->tx_bytes_base));
+       }
+}
+
+DEFPY (show_srv6_sid_counters,
+       show_srv6_sid_counters_cmd,
+       "show segment-routing srv6 sid [X:X::X:X$sid] counters [json$uj]",
+       SHOW_STR
+       "Segment Routing\n"
+       "Segment Routing over IPv6 (SRv6)\n"
+       "SRv6 SID\n"
+       "SID value (X:X::X)\n"
+       "TX/RX statistics counters\n"
+       JSON_STR)
+{
+       struct srv6_sid_stat_show ctx = { .vty = vty };
+       struct in6_addr filter;
+
+       zebra_srv6_sid_stats_poll();
+
+       if (sid_str) {
+               filter = sid;
+               ctx.filter = &filter;
+       }
+       if (uj)
+               ctx.json = json_object_new_object();
+       else
+               vty_out(vty, "%-32s %-12s %12s %14s %12s %14s\n", "SID", "Role", "RX-pkts",
+                       "RX-bytes", "TX-pkts", "TX-bytes");
+
+       zebra_srv6_sid_stats_walk(srv6_sid_stat_show_one, &ctx);
+
+       if (uj)
+               vty_json(vty, ctx.json);
+       return CMD_SUCCESS;
+}
+
+DEFPY (clear_srv6_sid_counters,
+       clear_srv6_sid_counters_cmd,
+       "clear segment-routing srv6 sid [X:X::X:X$sid] counters",
+       CLEAR_STR
+       "Segment Routing\n"
+       "Segment Routing over IPv6 (SRv6)\n"
+       "SRv6 SID\n"
+       "SID value (X:X::X)\n"
+       "TX/RX statistics counters\n")
+{
+       zebra_srv6_sid_stats_poll();
+       zebra_srv6_sid_stats_clear(sid_str ? &sid : NULL);
+       return CMD_SUCCESS;
 }
 
 DEFPY (show_srv6_sid,
@@ -2280,4 +2375,7 @@ void zebra_srv6_vty_init(void)
 	install_element(VIEW_NODE, &show_srv6_locator_detail_cmd);
 	install_element(VIEW_NODE, &show_srv6_manager_cmd);
 	install_element(VIEW_NODE, &show_srv6_sid_cmd);
+
+	install_element(VIEW_NODE, &show_srv6_sid_counters_cmd);
+	install_element(ENABLE_NODE, &clear_srv6_sid_counters_cmd);
 }
