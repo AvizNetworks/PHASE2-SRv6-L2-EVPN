@@ -246,6 +246,8 @@ static void zevpn_print_neigh_hash_all_evpn(struct hash_bucket *bucket,
 
 	zevpn = (struct zebra_evpn *)bucket->data;
 
+	bool is_evi = zebra_srv6_evi_lookup(zevpn->vni) != NULL;
+
 	num_neigh = zebra_neigh_db_count(zevpn->neigh_table);
 
 	if (print_dup)
@@ -253,8 +255,8 @@ static void zevpn_print_neigh_hash_all_evpn(struct hash_bucket *bucket,
 
 	if (json == NULL) {
 		vty_out(vty,
-			"\nVNI %u #ARP (IPv4 and IPv6, local and remote) %u\n\n",
-			zevpn->vni, num_neigh);
+			"\n%s %u #ARP (IPv4 and IPv6, local and remote) %u\n\n",
+			is_evi ? "EVI" : "VNI", zevpn->vni, num_neigh);
 	} else {
 		json_evpn = json_object_new_object();
 		json_object_int_add(json_evpn, "numArpNd", num_neigh);
@@ -282,7 +284,7 @@ static void zevpn_print_neigh_hash_all_evpn(struct hash_bucket *bucket,
 	zebra_evpn_find_neigh_addr_width(zevpn->neigh_table, &addr_width, &r_vtep_width);
 
 	if (json == NULL)
-		zebra_evpn_print_neigh_hdr(vty, addr_width, r_vtep_width);
+		zebra_evpn_print_neigh_hdr(vty, addr_width, r_vtep_width, is_evi);
 
 	if (print_dup)
 		frr_each (zebra_neigh_db, zevpn->neigh_table, n)
@@ -478,11 +480,14 @@ static void zevpn_print_mac_hash_all_evpn(struct hash_bucket *bucket, void *ctxt
 	}
 
 	if (json == NULL && !CHECK_FLAG(wctx->flags, SHOW_REMOTE_MAC_FROM_VTEP)) {
-		vty_out(vty, "\nVNI %u #MACs (local and remote) %u\n\n", zevpn->vni, num_macs);
+		bool is_evi = zebra_srv6_evi_lookup(zevpn->vni) != NULL;
+
+		vty_out(vty, "\n%s %u #MACs (local and remote) %u\n\n",
+			is_evi ? "EVI" : "VNI", zevpn->vni, num_macs);
 		vty_out(vty,
 			"Flags: N=sync-neighs, I=local-inactive, P=peer-active, X=peer-proxy\n");
 		vty_out(vty, "%-17s %-6s %-5s %-39s %-5s %s\n", "MAC", "Type", "Flags",
-			"Intf/Remote ES/VTEP", "VLAN", "Seq #'s");
+			is_evi ? "Intf/Remote ES/PE" : "Intf/Remote ES/VTEP", "VLAN", "Seq #'s");
 	}
 
 	if (!num_macs) {
@@ -3368,9 +3373,13 @@ void zebra_vxlan_print_neigh_vni(struct vty *vty, struct zebra_vrf *zvrf,
 		if (use_json)
 			vty_json_empty(vty, json);
 		else
-			vty_out(vty, "%% VNI %u does not exist\n", vni);
+			vty_out(vty, "%% %s %u does not exist\n",
+				zebra_srv6_evi_lookup(vni) ? "EVI" : "VNI", vni);
 		return;
 	}
+
+	bool is_evi = zebra_srv6_evi_lookup(vni) != NULL;
+
 	num_neigh = zebra_neigh_db_count(zevpn->neigh_table);
 	if (!num_neigh) {
 		if (use_json)
@@ -3394,9 +3403,9 @@ void zebra_vxlan_print_neigh_vni(struct vty *vty, struct zebra_vrf *zvrf,
 
 	if (!use_json) {
 		vty_out(vty,
-			"Number of ARPs (local and remote) known for this VNI: %u\n",
-			num_neigh);
-		zebra_evpn_print_neigh_hdr(vty, addr_width, r_vtep_width);
+			"Number of ARPs (local and remote) known for this %s: %u\n",
+			is_evi ? "EVI" : "VNI", num_neigh);
+		zebra_evpn_print_neigh_hdr(vty, addr_width, r_vtep_width, is_evi);
 	} else
 		json_object_int_add(json, "numArpNd", num_neigh);
 
@@ -3668,9 +3677,13 @@ void zebra_vxlan_print_macs_vni(struct vty *vty, struct zebra_vrf *zvrf,
 		if (use_json)
 			vty_json_empty(vty, NULL);
 		else
-			vty_out(vty, "%% VNI %u does not exist\n", vni);
+			vty_out(vty, "%% %s %u does not exist\n",
+				zebra_srv6_evi_lookup(vni) ? "EVI" : "VNI", vni);
 		return;
 	}
+
+	bool is_evi = zebra_srv6_evi_lookup(vni) != NULL;
+
 	num_macs = num_valid_macs(zevpn);
 	if (!num_macs) {
 		if (use_json)
@@ -3690,16 +3703,17 @@ void zebra_vxlan_print_macs_vni(struct vty *vty, struct zebra_vrf *zvrf,
 
 	if (!use_json) {
 		if (detail) {
-			vty_out(vty, "\nVNI %u #MACs (local and remote) %u\n\n",
-				zevpn->vni, num_macs);
+			vty_out(vty, "\n%s %u #MACs (local and remote) %u\n\n",
+				is_evi ? "EVI" : "VNI", zevpn->vni, num_macs);
 		} else {
 			vty_out(vty,
-				"Number of MACs (local and remote) known for this VNI: %u\n",
-				num_macs);
+				"Number of MACs (local and remote) known for this %s: %u\n",
+				is_evi ? "EVI" : "VNI", num_macs);
 			vty_out(vty,
 				"Flags: N=sync-neighs, I=local-inactive, P=peer-active, X=peer-proxy\n");
 			vty_out(vty, "%-17s %-6s %-5s %-39s %-5s %s\n", "MAC", "Type", "Flags",
-				"Intf/Remote ES/VTEP", "VLAN", "Seq #'s");
+				is_evi ? "Intf/Remote ES/PE" : "Intf/Remote ES/VTEP", "VLAN",
+				"Seq #'s");
 		}
 	} else
 		json_object_int_add(json, "numMacs", num_macs);
@@ -3887,7 +3901,8 @@ void zebra_vxlan_print_macs_vni_dad(struct vty *vty,
 		if (use_json)
 			vty_json_empty(vty, NULL);
 		else
-			vty_out(vty, "%% VNI %u does not exist\n", vni);
+			vty_out(vty, "%% %s %u does not exist\n",
+				zebra_srv6_evi_lookup(vni) ? "EVI" : "VNI", vni);
 		return;
 	}
 
@@ -3916,11 +3931,13 @@ void zebra_vxlan_print_macs_vni_dad(struct vty *vty,
 	wctx.json = json_mac;
 
 	if (!use_json) {
+		bool is_evi = zebra_srv6_evi_lookup(vni) != NULL;
+
 		vty_out(vty,
-		"Number of MACs (local and remote) known for this VNI: %u\n",
-			num_macs);
+		"Number of MACs (local and remote) known for this %s: %u\n",
+			is_evi ? "EVI" : "VNI", num_macs);
 		vty_out(vty, "%-17s %-6s %-5s %-39s %-5s\n", "MAC", "Type", "Flags",
-			"Intf/Remote ES/VTEP", "VLAN");
+			is_evi ? "Intf/Remote ES/PE" : "Intf/Remote ES/VTEP", "VLAN");
 	} else
 		json_object_int_add(json, "numMacs", num_macs);
 
@@ -6346,8 +6363,17 @@ void zebra_vxlan_advertise_svi_macip(ZAPI_HANDLER_ARGS)
 			return;
 
 		ifp = zevpn->vxlan_if;
-		if (!ifp)
+		if (!ifp) {
+			/* SRv6 EVI: re-run svi-macip registration now that the
+			 * per-EVI knob changed - see the matching comment in
+			 * zebra_evpn_gw_macip_add_for_evpn_hash().
+			 */
+			struct zebra_srv6_evi *evi = zebra_srv6_evi_lookup(vni);
+
+			if (evi && evi->bridge_if && evi->vrf_id != VRF_DEFAULT)
+				zebra_srv6_evpn_gw_macip_add(evi->bridge_if, zevpn);
 			return;
+		}
 
 		zif = ifp->info;
 
@@ -6519,8 +6545,17 @@ void zebra_vxlan_advertise_gw_macip(ZAPI_HANDLER_ARGS)
 			return;
 
 		ifp = zevpn->vxlan_if;
-		if (!ifp)
+		if (!ifp) {
+			/* SRv6 EVI: re-run gw-macip registration now that the
+			 * per-EVI knob changed - see the matching comment in
+			 * zebra_evpn_gw_macip_add_for_evpn_hash().
+			 */
+			struct zebra_srv6_evi *evi = zebra_srv6_evi_lookup(vni);
+
+			if (evi && evi->bridge_if && evi->vrf_id != VRF_DEFAULT)
+				zebra_srv6_evpn_gw_macip_add(evi->bridge_if, zevpn);
 			return;
+		}
 
 		zif = ifp->info;
 

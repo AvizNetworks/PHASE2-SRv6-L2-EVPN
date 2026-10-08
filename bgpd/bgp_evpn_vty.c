@@ -422,6 +422,8 @@ static void evpn_l2vni_fill_json(json_object *json_vni, struct bgpevpn *vpn, str
 {
 	json_object_string_addf(json_vni, "vni", "%u", vpn->vni);
 	json_object_string_add(json_vni, "type", "L2");
+	if (bgp_evpn_vpn_is_evi(vpn))
+		json_object_boolean_true_add(json_vni, "evi");
 	json_object_string_add(json_vni, "inKernel", is_vni_live(vpn) ? "True" : "False");
 	json_object_string_addf(json_vni, "rd", BGP_RD_AS_FORMAT(asnotation), &vpn->prd);
 	json_object_string_addf(json_vni, "originatorIp", "%pIA", &vpn->originator_ip);
@@ -541,17 +543,17 @@ static void display_l2vni(struct vty *vty, struct bgpevpn *vpn, json_object *jso
 		json_object_string_add(json, "sviInterface",
 				       ifindex2ifname(vpn->svi_ifindex, vpn->tenant_vrf_id));
 
-		if (CHECK_FLAG(vpn->flags, VNI_FLAG_EVI))
+		if (bgp_evpn_vpn_is_evi(vpn))
 			json_object_boolean_true_add(json, "evi");
 	} else {
-		vty_out(vty, "%s: %u", CHECK_FLAG(vpn->flags, VNI_FLAG_EVI) ? "EVI" : "VNI",
+		vty_out(vty, "%s: %u", bgp_evpn_vpn_is_evi(vpn) ? "EVI" : "VNI",
 			vpn->vni);
 		if (is_vni_live(vpn))
 			vty_out(vty, " (known to the kernel)");
 		vty_out(vty, "\n");
 
 		vty_out(vty, "  Type: %s\n",
-			CHECK_FLAG(vpn->flags, VNI_FLAG_EVI) ? "L2 (SRv6 EVI)" : "L2");
+			bgp_evpn_vpn_is_evi(vpn) ? "L2 (SRv6 EVI)" : "L2");
 		vty_out(vty, "  Tenant-Vrf: %s\n", vrf_id_to_name(vpn->tenant_vrf_id));
 		vty_out(vty, "  RD: ");
 		vty_out(vty, BGP_RD_AS_FORMAT(asnotation), &vpn->prd);
@@ -1101,6 +1103,21 @@ static void show_l3vni_entry(struct vty *vty, struct bgp *bgp, json_object *json
 			       &bgp->effective_fq_export_rts, bgp->vrf_id);
 }
 
+/*
+ * Classify each L2 VNI as a real SRv6 EVI (per bgp_evpn_vpn_is_evi()) or a
+ * plain VXLAN VNI, so summary counts reflect actual composition rather than
+ * which CLI keyword ('vni'/'evi') the operator happened to type.
+ */
+static void count_evi_vni_entry(struct hash_bucket *bucket, uint32_t *counts)
+{
+	struct bgpevpn *vpn = (struct bgpevpn *)bucket->data;
+
+	if (bgp_evpn_vpn_is_evi(vpn))
+		counts[0]++;
+	else
+		counts[1]++;
+}
+
 static void show_l2vni_entry(struct hash_bucket *bucket, void *args[])
 {
 	struct vty *vty;
@@ -1127,7 +1144,8 @@ static void show_l2vni_entry(struct hash_bucket *bucket, void *args[])
 	if (json) {
 		evpn_l2vni_fill_json(json_vni, vpn, bgp_evpn, asnotation);
 	} else {
-		vty_out(vty, "%-1s %-10u %-4s ", buf1, vpn->vni, "L2");
+		vty_out(vty, "%-1s %-10u %-8s ", buf1, vpn->vni,
+			bgp_evpn_vpn_is_evi(vpn) ? "L2(EVI)" : "L2");
 		vty_out(vty, BGP_RD_AS_FORMAT_SPACE(asnotation), &vpn->prd);
 	}
 
@@ -1418,9 +1436,22 @@ static void show_evpn_srv6_route_line(struct ttable *tt, const struct prefix_evp
 				      const struct prefix *p, struct bgp_path_info *pi)
 {
 	const struct bgp_attr_srv6_service *s = bgp_attr_get_srv6_l2service(pi->attr);
+	struct prefix_evpn tmp_p;
 	char pfxbuf[PREFIX2STR_BUFFER];
 	char sidbuf[INET6_ADDRSTRLEN];
 	char nhbuf[INET6_ADDRSTRLEN];
+
+	/* VNI ip_table prefixes carry a zeroed MAC in the node key (the real
+	 * MAC lives on the path info, since one IP can migrate between MACs);
+	 * reconstruct it here the same way route_vty_out_detail()'s callers do,
+	 * so the MAC actually learned via ARP/ND isn't displayed as all-zero.
+	 */
+	if (evp->prefix.route_type == BGP_EVPN_MAC_IP_ROUTE &&
+	    !is_evpn_prefix_ipaddr_none(evp)) {
+		evpn_type2_prefix_global_copy(&tmp_p, evp, evpn_type2_path_info_get_mac(pi), NULL);
+		evp = &tmp_p;
+		p = (const struct prefix *)&tmp_p;
+	}
 
 	snprintfrr(pfxbuf, sizeof(pfxbuf), "%pFX", p);
 	snprintfrr(sidbuf, sizeof(sidbuf), "%pI6", &s->sid);
@@ -1573,8 +1604,33 @@ static void show_evpn_srv6_routes_per_vni(struct hash_bucket *bucket, void *arg)
 			bool route_matched = false;
 
 			for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+				struct prefix tmp_p;
+				const struct prefix *disp_p = p;
+				const struct prefix_evpn *disp_evp = evp;
+
 				if (!pi->attr || !bgp_attr_get_srv6_l2service(pi->attr))
 					continue;
+
+				/*
+				 * VNI IP/MAC table prefixes don't carry the MAC/IP
+				 * respectively (the node key strips it), so reconstruct
+				 * the real MAC/IP from path info before displaying, same
+				 * as the detail dump in show_evpn_route_vni_all() does.
+				 */
+				if (evp->prefix.route_type == BGP_EVPN_MAC_IP_ROUTE) {
+					if (is_evpn_prefix_ipaddr_none(evp))
+						evpn_type2_prefix_global_copy(
+							(struct prefix_evpn *)&tmp_p, evp,
+							NULL /* mac */,
+							evpn_type2_path_info_get_ip(pi));
+					else
+						evpn_type2_prefix_global_copy(
+							(struct prefix_evpn *)&tmp_p, evp,
+							evpn_type2_path_info_get_mac(pi),
+							NULL /* ip */);
+					disp_p = &tmp_p;
+					disp_evp = (const struct prefix_evpn *)&tmp_p;
+				}
 
 				if (!header_printed) {
 					vty_out(vty, "\n  EVI %u", vpn->vni);
@@ -1600,11 +1656,11 @@ static void show_evpn_srv6_routes_per_vni(struct hash_bucket *bucket, void *arg)
 				}
 
 				if (wctx->detail)
-					route_vty_out_detail(vty, wctx->bgp, dest, p, pi,
+					route_vty_out_detail(vty, wctx->bgp, dest, disp_p, pi,
 							     AFI_L2VPN, SAFI_EVPN,
 							     RPKI_NOT_BEING_USED, NULL, NULL, 0);
 				else
-					show_evpn_srv6_route_line(tt, evp, p, pi);
+					show_evpn_srv6_route_line(tt, disp_evp, disp_p, pi);
 
 				wctx->path_cnt++;
 				route_matched = true;
@@ -3830,7 +3886,7 @@ static void evpn_show_all_vnis(struct vty *vty, struct bgp *bgp, json_object *js
 
 	if (!json) {
 		vty_out(vty, "Flags: * - Kernel\n");
-		vty_out(vty, "  %-10s %-4s %-21s %-25s %-25s %-25s %-37s\n",
+		vty_out(vty, "  %-10s %-8s %-21s %-25s %-25s %-25s %-37s\n",
 			use_evi ? "EVI" : "VNI", "Type", "RD", "Import RT", "Export RT",
 			"MAC-VRF Site-of-Origin", "Tenant VRF");
 	}
@@ -4168,7 +4224,9 @@ static void write_vni_config(struct vty *vty, struct bgpevpn *vpn)
 			vty_out(vty, "   auto-route-target export %s\n", autort_mode_str);
 
 		if (vpn->advertise_gw_macip)
-			vty_out(vty, "   advertise-default-gw\n");
+			vty_out(vty, "   %s\n",
+				bgp_evpn_vpn_is_evi(vpn) ? "advertise-anycast-gw"
+							 : "advertise-default-gw");
 
 		if (vpn->advertise_svi_macip)
 			vty_out(vty, "   advertise-svi-ip\n");
@@ -4296,6 +4354,26 @@ DEFPY (no_bgp_evpn_advertise_default_vni_gw,
 	return CMD_SUCCESS;
 }
 
+/*
+ * SRv6 L2 EVPN: 'advertise-anycast-gw' is an alias of 'advertise-default-gw'
+ * for SRv6 EVIs. Same underlying knob/attributes (RFC 9135 SS9 Default
+ * Gateway EC + sticky MAC Mobility EC) - "default-gw" carries a
+ * centralized-routing connotation from classic VXLAN EVPN docs (Cisco/
+ * Cumulus: advertise-default-gw = "this device is THE designated gateway,
+ * route through me") that doesn't match this feature's distributed IRB
+ * model, where every PE independently routes for its own locally-attached
+ * hosts and merely shares the same anycast gateway identity.
+ */
+ALIAS(bgp_evpn_advertise_default_gw_vni,
+      bgp_evpn_advertise_anycast_gw_vni_cmd,
+      "advertise-anycast-gw",
+      "Advertise anycast gateway mac-ip routes in EVPN for an EVI\n")
+
+ALIAS(no_bgp_evpn_advertise_default_vni_gw,
+      no_bgp_evpn_advertise_anycast_gw_vni_cmd,
+      "no advertise-anycast-gw",
+      NO_STR
+      "Withdraw anycast gateway mac-ip routes from EVPN for an EVI\n")
 
 DEFPY (bgp_evpn_advertise_default_gw,
        bgp_evpn_advertise_default_gw_cmd,
@@ -4333,6 +4411,18 @@ DEFPY (no_bgp_evpn_advertise_default_gw,
 
 	return CMD_SUCCESS;
 }
+
+/* SRv6 L2 EVPN: global alias of 'advertise-default-gw', see comment above. */
+ALIAS(bgp_evpn_advertise_default_gw,
+      bgp_evpn_advertise_anycast_gw_cmd,
+      "advertise-anycast-gw",
+      "Advertise All anycast gateway mac-ip routes in EVPN\n")
+
+ALIAS(no_bgp_evpn_advertise_default_gw,
+      no_bgp_evpn_advertise_anycast_gw_cmd,
+      "no advertise-anycast-gw",
+      NO_STR
+      "Withdraw All anycast gateway mac-ip routes from EVPN\n")
 
 DEFPY (bgp_evpn_advertise_all_vni,
        bgp_evpn_advertise_all_vni_cmd,
@@ -5466,7 +5556,16 @@ DEFPY(show_bgp_l2vpn_evpn_vni,
 		json = json_object_new_object();
 
 	if (!vni_str) {
+		uint32_t evi_vni_counts[2] = { 0, 0 };
+		uint32_t num_l2_evis, num_l2_vnis_only;
+
 		num_l2vnis = hashcount(bgp_evpn->vnihash);
+
+		hash_iterate(bgp_evpn->vnihash,
+			     (void (*)(struct hash_bucket *, void *))count_evi_vni_entry,
+			     evi_vni_counts);
+		num_l2_evis = evi_vni_counts[0];
+		num_l2_vnis_only = evi_vni_counts[1];
 
 		for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp_temp)) {
 			if (bgp_temp->l3vni)
@@ -5495,7 +5594,8 @@ DEFPY(show_bgp_l2vpn_evpn_vni,
 					? "Enabled"
 					: "Disabled");
 			json_object_int_add(json, "numVnis", num_vnis);
-			json_object_int_add(json, "numL2Vnis", num_l2vnis);
+			json_object_int_add(json, "numL2Vnis", num_l2_vnis_only);
+			json_object_int_add(json, "numL2Evis", num_l2_evis);
 			json_object_int_add(json, "numL3Vnis", num_l3vnis);
 		} else {
 			vty_out(vty, "Advertise Gateway Macip: %s\n",
@@ -5508,13 +5608,18 @@ DEFPY(show_bgp_l2vpn_evpn_vni,
 						VXLAN_FLOOD_HEAD_END_REPL
 					? "Head-end replication"
 					: "Disabled");
-			vty_out(vty, "VXLAN flooding: %s\n",
-				bgp_evpn->vxlan_flood_ctrl ==
-						VXLAN_FLOOD_HEAD_END_REPL
-					? "Enabled"
-					: "Disabled");
-			vty_out(vty, "Number of L2 %s: %u\n", use_evi ? "EVIs" : "VNIs",
-				num_l2vnis);
+			/* The vxlan_flood_ctrl knob only governs VXLAN VNIs;
+			 * SRv6 EVI BUM handling (End.DT2M / ingress replication
+			 * over a per-EVI SRv6 SID) is unrelated, so only show
+			 * this line when at least one plain VXLAN VNI exists. */
+			if (num_l2_vnis_only)
+				vty_out(vty, "VXLAN flooding: %s\n",
+					bgp_evpn->vxlan_flood_ctrl ==
+							VXLAN_FLOOD_HEAD_END_REPL
+						? "Enabled"
+						: "Disabled");
+			vty_out(vty, "Number of L2 VNIs: %u\n", num_l2_vnis_only);
+			vty_out(vty, "Number of L2 EVIs: %u\n", num_l2_evis);
 			vty_out(vty, "Number of L3 VNIs: %u\n", num_l3vnis);
 		}
 		evpn_show_all_vnis(vty, bgp_evpn, json, use_evi);
@@ -8942,6 +9047,8 @@ void bgp_ethernetvpn_init(void)
 	install_element(BGP_EVPN_NODE, &no_bgp_evpn_advertise_autort_rfc8365_cmd);
 	install_element(BGP_EVPN_NODE, &bgp_evpn_advertise_default_gw_cmd);
 	install_element(BGP_EVPN_NODE, &no_bgp_evpn_advertise_default_gw_cmd);
+	install_element(BGP_EVPN_NODE, &bgp_evpn_advertise_anycast_gw_cmd);
+	install_element(BGP_EVPN_NODE, &no_bgp_evpn_advertise_anycast_gw_cmd);
 	install_element(BGP_EVPN_NODE, &bgp_evpn_advertise_svi_ip_cmd);
 	install_element(BGP_EVPN_NODE, &macvrf_soo_global_cmd);
 	install_element(BGP_EVPN_NODE, &no_macvrf_soo_global_cmd);
@@ -9055,6 +9162,10 @@ void bgp_ethernetvpn_init(void)
 			&bgp_evpn_advertise_default_gw_vni_cmd);
 	install_element(BGP_EVPN_VNI_NODE,
 			&no_bgp_evpn_advertise_default_gw_vni_cmd);
+	install_element(BGP_EVPN_VNI_NODE,
+			&bgp_evpn_advertise_anycast_gw_vni_cmd);
+	install_element(BGP_EVPN_VNI_NODE,
+			&no_bgp_evpn_advertise_anycast_gw_vni_cmd);
 	install_element(BGP_EVPN_VNI_NODE, &bgp_evpn_advertise_vni_subnet_cmd);
 	install_element(BGP_EVPN_VNI_NODE,
 			&no_bgp_evpn_advertise_vni_subnet_cmd);

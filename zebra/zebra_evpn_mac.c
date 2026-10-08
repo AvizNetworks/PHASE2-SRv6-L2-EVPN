@@ -1041,9 +1041,13 @@ void zebra_evpn_print_mac_hash(struct hash_bucket *bucket, void *ctxt)
 		if (json_mac_hdr == NULL) {
 			if (CHECK_FLAG(wctx->flags, SHOW_REMOTE_MAC_FROM_VTEP) &&
 			    (wctx->count == 0)) {
-				vty_out(vty, "\nVNI %u\n\n", wctx->zevpn->vni);
+				bool is_evi = zebra_srv6_evi_lookup(wctx->zevpn->vni) != NULL;
+
+				vty_out(vty, "\n%s %u\n\n", is_evi ? "EVI" : "VNI",
+					wctx->zevpn->vni);
 				vty_out(vty, "%-17s %-6s %-5s %-39s %-5s %s\n", "MAC", "Type",
-					"Flags", "Intf/Remote ES/VTEP", "VLAN", "Seq #'s");
+					"Flags", is_evi ? "Intf/Remote ES/PE" : "Intf/Remote ES/VTEP",
+					"VLAN", "Seq #'s");
 			}
 			if (mac->es == NULL)
 				ipaddr2str(&mac->fwd_info.r_vtep_ip, addr_buf, sizeof(addr_buf));
