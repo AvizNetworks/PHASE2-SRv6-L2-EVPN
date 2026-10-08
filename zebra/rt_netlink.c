@@ -28,6 +28,7 @@
 #include <linux/if_tunnel.h>
 #include <linux/if_bridge.h>
 #include <string.h>
+#include <sys/utsname.h>
 
 /*
  * End.DT2U (RFC 8986 Section 4.1.12) and End.DT2M (RFC 8986 Section 4.1.13) are not yet
@@ -89,6 +90,7 @@
 #include "lib/srv6.h"
 #include "zebra/zebra_sr6.h"
 #include "zebra/zebra_dplane.h"
+#include "zebra/zebra_srv6_sid_stats.h"
 
 #ifndef AF_MPLS
 #define AF_MPLS 28
@@ -121,6 +123,64 @@ static struct in_addr ipv4_ll;
 
 static int netlink_nexthop_msg_encode_end_b6_encaps(struct nlmsghdr *nlmsg,
 						    const struct nexthop *nh, size_t buflen);
+
+/*
+ * SEG6_LOCAL_COUNTERS (Linux >= 5.3) is safe to request unconditionally for
+ * the SRv6 L2 EVPN behaviors this feature introduces (End.DX2/DT2U/DT2M) -
+ * those are only ever installed on the >=5.14 kernels this feature already
+ * requires. The pre-existing behaviors (End.DT4/DT6/DT46 among others) are
+ * also used by plain SRv6 L3VPN, which supports kernels as old as 4.15 (see
+ * the bgp_srv6l3vpn_to_bgp_vrf topotest) - well before SEG6_LOCAL_COUNTERS
+ * existed. Adding the attribute unconditionally there would make the whole
+ * seg6local route install fail with EINVAL on those kernels, blackholing
+ * the SID entirely rather than just leaving it uncounted.
+ *
+ * There is no side-effect-free way to ask the kernel whether it understands
+ * a specific lwtunnel encap sub-attribute (unlike e.g. RTM_GETNEXTHOP, a
+ * whole message type whose support can be probed with a harmless dump -
+ * see netlink_nexthop_read()), so fall back to comparing the running
+ * kernel release against the version SEG6_LOCAL_COUNTERS was introduced
+ * in. Cache the result: it cannot change at runtime, and this is checked
+ * on every seg6local route install. Any parse ambiguity resolves to
+ * "unsupported" - the failure mode of wrongly omitting the attribute is a
+ * missing counter, not a missing route.
+ */
+static bool seg6local_counters_supported(void)
+{
+	static int cached = -1;
+	struct utsname uts;
+	unsigned int major, minor;
+	bool supported;
+
+	if (cached >= 0)
+		return !!cached;
+
+	supported = uname(&uts) == 0 && sscanf(uts.release, "%u.%u", &major, &minor) == 2 &&
+		   (major > 5 || (major == 5 && minor >= 3));
+	cached = supported ? 1 : 0;
+
+	if (IS_ZEBRA_DEBUG_KERNEL)
+		zlog_debug("seg6local SID counters %ssupported on this kernel",
+			  supported ? "" : "not ");
+
+	return supported;
+}
+
+static bool netlink_seg6local_add_counters(struct nlmsghdr *n, size_t maxlen)
+{
+       struct rtattr *nest;
+       uint64_t zero = 0;
+
+       nest = nl_attr_nest(n, maxlen, SEG6_LOCAL_COUNTERS);
+       if (!nest)
+               return false;
+       if (!nl_attr_put(n, maxlen, SEG6_LOCAL_CNT_PACKETS, &zero, sizeof(zero)) ||
+           !nl_attr_put(n, maxlen, SEG6_LOCAL_CNT_BYTES, &zero, sizeof(zero)) ||
+           !nl_attr_put(n, maxlen, SEG6_LOCAL_CNT_ERRORS, &zero, sizeof(zero)))
+               return false;
+       nl_attr_nest_end(n, nest);
+       return true;
+}
 
 /* Is this a ipv4 over ipv6 route? */
 static bool is_route_v4_over_v6(unsigned char rtm_family,
@@ -1943,6 +2003,31 @@ static bool _netlink_nexthop_encode_seg6local_info(const struct nexthop *nexthop
 		zlog_err("%s: unsupported seg6local behavior, action=%u", __func__,
 			 nexthop->nh_srv6->seg6local_action);
 		return false;
+	}
+
+	/*
+	 * SEG6_LOCAL_COUNTERS (Linux >= 5.3): always requested for the SRv6
+	 * L2 EVPN behaviors this feature introduces (End.DX2 / End.DT2U /
+	 * End.DT2M), which only ever run on the >=5.14 kernels this feature
+	 * requires. Also requested for the VRF-level End.DT4 / End.DT6 /
+	 * End.DT46 SIDs, but only once seg6local_counters_supported() has
+	 * confirmed the running kernel understands the attribute - those
+	 * three are shared with plain SRv6 L3VPN, which supports kernels
+	 * back to 4.15, pre-dating this attribute (see
+	 * seg6local_counters_supported() for why that matters here).
+	 */
+	{
+		bool want_counters =
+			nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_END_DX2 ||
+			nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_END_DT2U ||
+			nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_END_DT2M ||
+			((nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_END_DT4 ||
+			 nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_END_DT6 ||
+			 nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_END_DT46) &&
+			 seg6local_counters_supported());
+
+		if (want_counters && !netlink_seg6local_add_counters(nlmsg, buflen))
+			return false;
 	}
 
 	if (!_netlink_nexthop_encode_seg6local_flavor(nexthop, nlmsg, buflen))
