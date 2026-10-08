@@ -557,76 +557,105 @@ static int zebra_read_route(ZAPI_CALLBACK_ARGS)
 {
 	enum nexthop_types_t nhtype = 0;
 	enum blackhole_type bhtype = BLACKHOLE_UNSPEC;
-	struct zapi_route api;
+	/*
+	 * struct zapi_route is large (SRv6 seg6/seg6local fields add ~190
+	 * bytes per nexthop across MULTIPATH_NUM primary + backup slots,
+	 * ~11.6KB total) - heap allocate rather than putting it on the
+	 * stack of this event-driven callback, which can run at a deep
+	 * nesting level during bulk EVPN/VPWS route realization.
+	 */
+	struct zapi_route *api;
 	union g_addr nexthop = {};
 	ifindex_t ifindex = IFINDEX_INTERNAL;
 	uint32_t seg6local_action = ZEBRA_SEG6_LOCAL_ACTION_UNSPEC;
 	const struct seg6local_context *seg6local_ctx = NULL;
-	int add;
+	int add, i, ret = 0;
 	struct bgp *bgp;
 
 	bgp = bgp_lookup_by_vrf_id(vrf_id);
 	if (!bgp)
 		return 0;
 
-	if (zapi_route_decode(zclient->ibuf, &api) < 0)
-		return -1;
+	api = XMALLOC(MTYPE_TMP, sizeof(struct zapi_route));
+
+	if (zapi_route_decode(zclient->ibuf, api) < 0) {
+		ret = -1;
+		goto done;
+	}
 
 	/* we completely ignore srcdest routes for now. */
-	if (CHECK_FLAG(api.message, ZAPI_MESSAGE_SRCPFX))
-		return 0;
+	if (CHECK_FLAG(api->message, ZAPI_MESSAGE_SRCPFX))
+		goto done;
 
 	/* ignore link-local address. */
-	if (api.prefix.family == AF_INET6
-	    && IN6_IS_ADDR_LINKLOCAL(&api.prefix.u.prefix6))
-		return 0;
+	if (api->prefix.family == AF_INET6
+	    && IN6_IS_ADDR_LINKLOCAL(&api->prefix.u.prefix6))
+		goto done;
 
 	add = (cmd == ZEBRA_REDISTRIBUTE_ROUTE_ADD);
 	if (add) {
-		if (api.nexthop_num == 0)
-			return 0;
+		if (api->nexthop_num == 0)
+			goto done;
 
-		ifindex = api.nexthops[0].ifindex;
-		nhtype = api.nexthops[0].type;
+		ifindex = api->nexthops[0].ifindex;
+		nhtype = api->nexthops[0].type;
 
 		/* api_nh structure has union of gate and bh_type */
 		if (nhtype == NEXTHOP_TYPE_BLACKHOLE) {
 			/* bh_type is only applicable if NEXTHOP_TYPE_BLACKHOLE*/
-			bhtype = api.nexthops[0].bh_type;
+			bhtype = api->nexthops[0].bh_type;
 		} else
-			nexthop = api.nexthops[0].gate;
+			nexthop = api->nexthops[0].gate;
 
-		seg6local_action = api.nexthops[0].seg6local_action;
-		seg6local_ctx = &api.nexthops[0].seg6local_ctx;
+		seg6local_action = api->nexthops[0].seg6local_action;
+		seg6local_ctx = &api->nexthops[0].seg6local_ctx;
 
-		bgp_redistribute_add(bgp, &api.prefix, &nexthop, ifindex, nhtype, api.distance,
-				     bhtype, api.metric, api.type, api.instance, api.tag,
+		/*
+		 * The ADD message is actually an UPDATE and there is no
+		 * explicit DEL
+		 * for a prior redistributed route, if any. So, perform an
+		 * implicit
+		 * DEL processing for the same redistributed route from any
+		 * other
+		 * source type.
+		 */
+		for (i = 0; i < ZEBRA_ROUTE_MAX; i++) {
+			if (i != api->type)
+				bgp_redistribute_delete(bgp, &api->prefix, i,
+							api->instance);
+		}
+
+		/* Now perform the add/update. */
+		bgp_redistribute_add(bgp, &api->prefix, &nexthop, ifindex, nhtype, api->distance,
+				     bhtype, api->metric, api->type, api->instance, api->tag,
 				     seg6local_action, seg6local_ctx);
 	} else {
-		bgp_redistribute_delete(bgp, &api.prefix, api.type,
-					api.instance);
+		bgp_redistribute_delete(bgp, &api->prefix, api->type,
+					api->instance);
 	}
 
-	if (bgp_debug_zebra(&api.prefix)) {
+	if (bgp_debug_zebra(&api->prefix)) {
 		char buf[PREFIX_STRLEN];
 
 		if (add) {
-			inet_ntop(api.prefix.family, &nexthop, buf,
+			inet_ntop(api->prefix.family, &nexthop, buf,
 				  sizeof(buf));
 			zlog_debug("Rx route ADD %s %s[%d] %pFX nexthop %s (type %d if %u) metric %u distance %u tag %" ROUTE_TAG_PRI,
 				   bgp->name_pretty,
-				   zebra_route_string(api.type), api.instance,
-				   &api.prefix, buf, nhtype, ifindex,
-				   api.metric, api.distance, api.tag);
+				   zebra_route_string(api->type), api->instance,
+				   &api->prefix, buf, nhtype, ifindex,
+				   api->metric, api->distance, api->tag);
 		} else {
 			zlog_debug("Rx route DEL %s %s[%d] %pFX",
 				   bgp->name_pretty,
-				   zebra_route_string(api.type), api.instance,
-				   &api.prefix);
+				   zebra_route_string(api->type), api->instance,
+				   &api->prefix);
 		}
 	}
 
-	return 0;
+done:
+	XFREE(MTYPE_TMP, api);
+	return ret;
 }
 
 struct interface *if_lookup_by_ipv4(struct in_addr *addr, vrf_id_t vrf_id)
@@ -1415,6 +1444,20 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 
 		is_parent_evpn = is_route_parent_evpn(mpinfo);
 
+		/*
+		 * SRv6 VRF IRB: Type-2 MAC+IP route imported from EVPN table
+		 * into a VRF with SRv6 L3 service.  The parent is EVPN but we
+		 * must install using SRv6 encap (not MPLS/EVPN-label path),
+		 * so clear is_parent_evpn to let the SRv6 nexthop block fire.
+		 */
+		struct bgp_attr_srv6_service *srv6_l3service_irb =
+			bgp_attr_get_srv6_l3service(mpinfo_cp->attr);
+		bool is_srv6_vrf_irb =
+			is_parent_evpn && srv6_l3service_irb &&
+			!IN6_IS_ADDR_UNSPECIFIED(&srv6_l3service_irb->sid);
+		if (is_srv6_vrf_irb)
+			is_parent_evpn = false;
+
 		if (nh_family == AF_INET) {
 			nh_updated = update_ipv4nh_for_route_install(
 				nh_othervrf, bgp_orig,
@@ -1439,6 +1482,11 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 					mpinfo, info, is_parent_evpn, api_nh);
 		}
 
+		/* SRv6 VRF IRB: the SID nexthop lives in the default VRF's
+		 * IPv6 table, not in the tenant VRF -- force resolution there. */
+		if (is_srv6_vrf_irb)
+			api_nh->vrf_id = VRF_DEFAULT;
+
 		is_evpn = !!CHECK_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_EVPN);
 		bre = bgp_attr_get_evpn_overlay(mpinfo->attr);
 
@@ -1457,6 +1505,19 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 
 		num_labels = BGP_PATH_INFO_NUM_LABELS(mpinfo);
 		labels = num_labels ? mpinfo->extra->labels->label : NULL;
+
+		/* SRv6 VRF IRB: normally suppress MPLS/EVPN label — SRv6 encap
+		 * carries the forwarding instruction via seg6_segs below.
+		 * Exception: when the attached SID uses the RFC 9252 §4
+		 * transposition scheme (transposition_len != 0), the label
+		 * field is where the transposed function bits live — it must
+		 * survive so the transpose_sid() reconstruction below can run,
+		 * otherwise the SID we install into our own kernel FIB would
+		 * silently be missing its function bits. */
+		if (is_srv6_vrf_irb && srv6_l3service_irb->transposition_len == 0) {
+			num_labels = 0;
+			labels = NULL;
+		}
 
 		/*
 		 * The label of a path imported from EVPN is a VNI, which only
@@ -1515,10 +1576,21 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 			       sizeof(api_nh->seg6_segs[0]));
 			api_nh->srv6_encap_behavior = bgp_orig->srv6_encap_behavior;
 
-			if (srv6_l3service && labels && (num_labels > 0) &&
-			    bgp_is_valid_label(&labels[0]) &&
+			/* The L3 Service TLV's transposed function travels in
+			 * the L3 label slot, which bgp_evpn_path_info_labels_get_l3vni()
+			 * already defines for this codebase: the last label.
+			 * Type-5 and plain VPN carry one label, so that is
+			 * label[0]; a Type-2 carries two and label[0] is the
+			 * mandatory L2/EVI label, so the function is in
+			 * label[1]. Reading label[0] unconditionally would
+			 * splice the EVI label into the SID as if it were
+			 * function bits. */
+			mpls_label_t *l3_label_slot =
+				bgp_evpn_path_info_labels_get_l3vni(labels, num_labels);
+
+			if (srv6_l3service && l3_label_slot && bgp_is_valid_label(l3_label_slot) &&
 			    srv6_l3service->transposition_len != 0) {
-				mpls_lse_decode(labels[0], &nh_label, &ttl,
+				mpls_lse_decode(*l3_label_slot, &nh_label, &ttl,
 						&exp, &bos);
 
 				if (nh_label < MPLS_LABEL_UNRESERVED_MIN) {
@@ -3696,7 +3768,27 @@ static int bgp_zebra_process_local_vni(ZAPI_CALLBACK_ARGS)
 	 * the EVPN VTEP/originator IP.
 	 */
 	if (cmd == ZEBRA_VNI_ADD && ipaddr_is_zero(&vtep_ip)) {
-		ipaddr_set_v4(&vtep_ip, bgp->router_id);
+		if (!have_srv6 || !bgp_evpn_srv6_local_originator(bgp, &vtep_ip)) {
+			/*
+			 * No established underlay peer yet (or not SRv6): fall
+			 * back to the IPv4 router-id, same as before. For SRv6
+			 * this is a known-temporary placeholder - it lets the
+			 * local MAC/IP dest get created now (so it exists to be
+			 * refreshed later), and bgp_evpn_handle_peer_established()
+			 * corrects vpn->originator_ip and re-advertises with a
+			 * real nexthop once a peer establishes. Suppressing
+			 * route creation entirely here (rather than falling
+			 * back) was tried and reverted: it left nothing for the
+			 * self-heal to find, since update_all_type2_routes()
+			 * only refreshes MAC/IP entries that already exist in
+			 * vpn->mac_table/ip_table, not ones never created.
+			 */
+			if (have_srv6)
+				zlog_warn(
+					"SRv6 L2 EVPN: no local IPv6 BGP session found for VNI %u; falling back to IPv4 router-id as originator, until one establishes",
+					vni);
+			ipaddr_set_v4(&vtep_ip, bgp->router_id);
+		}
 		if (BGP_DEBUG(zebra, ZEBRA))
 			zlog_debug("Rx VNI add with unspecified VTEP IP, using router-id %pIA",
 				   &vtep_ip);
@@ -4439,6 +4531,18 @@ static int bgp_zebra_srv6_sid_notify(ZAPI_CALLBACK_ARGS)
 				srv6_locator_copy(bgp_vrf->vpn_policy[AFI_IP6].tovpn_sid_locator,
 						  locator_bgp);
 				bgp_vrf->vpn_policy[AFI_IP6].tovpn_sid_transpose_label = label;
+
+				/* Link any L2 VNIs whose tenant VRF is this VRF so
+				 * Type-2 routes carry the L3 SID too (symmetric IRB). */
+				bgp_evpn_link_l2vnis_to_vrf(bgp_vrf);
+
+				/* Register VRF import RTs so incoming Type-2/5 routes
+				 * can be matched and imported into this VRF. */
+				bgp_evpn_map_vrf_to_its_rts(bgp_vrf);
+
+				/* Import remote routes that match this VRF's RTs now
+				 * that the SRv6 VRF is live. */
+				bgp_evpn_install_routes_in_vrf(bgp_vrf);
 			} else if (is_srv6_unicast_enabled(bgp_vrf, AFI_IP6)) {
 				srv6_locator_free(bgp_vrf->srv6_unicast[AFI_IP6].sid_locator);
 				sid_unregister(bgp, bgp_vrf->srv6_unicast[AFI_IP6].sid);
@@ -4466,6 +4570,18 @@ static int bgp_zebra_srv6_sid_notify(ZAPI_CALLBACK_ARGS)
 				srv6_locator_copy(bgp_vrf->vpn_policy[AFI_IP].tovpn_sid_locator,
 						  locator_bgp);
 				bgp_vrf->vpn_policy[AFI_IP].tovpn_sid_transpose_label = label;
+
+				/* Link any L2 VNIs whose tenant VRF is this VRF so
+				 * Type-2 routes carry the L3 SID too (symmetric IRB). */
+				bgp_evpn_link_l2vnis_to_vrf(bgp_vrf);
+
+				/* Register VRF import RTs so incoming Type-2/5 routes
+				 * can be matched and imported into this VRF. */
+				bgp_evpn_map_vrf_to_its_rts(bgp_vrf);
+
+				/* Import remote routes that match this VRF's RTs now
+				 * that the SRv6 VRF is live. */
+				bgp_evpn_install_routes_in_vrf(bgp_vrf);
 			} else if (is_srv6_unicast_enabled(bgp_vrf, AFI_IP)) {
 				srv6_locator_free(bgp_vrf->srv6_unicast[AFI_IP].sid_locator);
 				sid_unregister(bgp, bgp_vrf->srv6_unicast[AFI_IP].sid);
@@ -4491,6 +4607,37 @@ static int bgp_zebra_srv6_sid_notify(ZAPI_CALLBACK_ARGS)
 				bgp_vrf->tovpn_sid_locator = srv6_locator_alloc(locator_bgp->name);
 				srv6_locator_copy(bgp_vrf->tovpn_sid_locator, locator_bgp);
 				bgp_vrf->tovpn_sid_transpose_label = label;
+
+				/* Install End.DT46 seg6local route in the kernel so
+				 * the local PE decapsulates SRv6 packets into VRF. */
+				vpn_leak_zebra_vrf_sid_update_per_vrf(bgp_vrf);
+
+				/* Link any L2 VNIs whose tenant VRF is this VRF so
+				 * Type-2 routes carry both L2 and L3 SIDs. */
+				bgp_evpn_link_l2vnis_to_vrf(bgp_vrf);
+
+				/* Re-advertise this VRF's Type-5 routes AND the
+				 * Type-2 (MAC+IP) routes of its linked L2 EVIs
+				 * with the now-live End.DT46 SID + L3 export RT.
+				 * Using the combined handler (not Type-5 alone)
+				 * is what fixes zebra-restart recovery: after a
+				 * restart the local MAC+IP Type-2 routes can be
+				 * re-originated before this SID notify makes the
+				 * VRF SRv6-live, so they come back carrying only
+				 * the L2 EVI RT and miss the L3 VRF RT - the
+				 * remote PE then never imports them into the
+				 * tenant VRF.  Re-originating the Type-2 routes
+				 * here re-attaches the L3 RT once the VRF is
+				 * live. */
+				bgp_evpn_handle_export_rt_change_for_vrf(bgp_vrf);
+
+				/* Register VRF import RTs so incoming Type-2/5 routes
+				 * can be matched and imported into this VRF. */
+				bgp_evpn_map_vrf_to_its_rts(bgp_vrf);
+
+				/* Import remote routes that match this VRF's RTs now
+				 * that the SRv6 VRF is live. */
+				bgp_evpn_install_routes_in_vrf(bgp_vrf);
 			}
 
 			/* Update DT46 unicast state only when at least one AFI SID changed. */
@@ -5193,8 +5340,8 @@ static bool bgp_zebra_label_manager_connect(void)
 {
 	/* Connect to label manager. */
 	if (zclient_socket_connect(bgp_zclient_sync) < 0) {
-		zlog_warn("%s: failed connecting synchronous zclient!",
-			  __func__);
+		zlog_warn("%s: failed connecting synchronous zclient! errno=%d(%s)",
+			  __func__, errno, safe_strerror(errno));
 		return false;
 	}
 	/* make socket non-blocking */
@@ -5268,6 +5415,7 @@ void bgp_zebra_init(struct event_loop *master, unsigned short instance)
 	hook_register_prio(if_up, 0, bgp_ifp_up);
 	hook_register_prio(if_down, 0, bgp_ifp_down);
 	hook_register_prio(if_unreal, 0, bgp_ifp_destroy);
+	hook_register(peer_established, bgp_evpn_handle_peer_established);
 
 	/* Set default values. */
 	bgp_zclient = zclient_new(master, &zclient_options_default, bgp_handlers,

@@ -2143,14 +2143,18 @@ DEFPY_NOSH (srv6_l2evpn_evi,
 	if (locator)
 		zebra_srv6_evi_set_locator(evi, locator);
 	if (bridge) {
-		/*
-		 * The bridge may not exist yet (operator-owned netdev created
-		 * later, or config reloaded before the bridge appears).  Keep the
-		 * configured NAME regardless; a NULL lookup here is resolved when
-		 * the bridge appears (zebra_srv6_l2evpn_bridge_resolve).
-		 */
-		struct interface *ifp = if_lookup_by_name(bridge, VRF_DEFAULT);
+		struct interface *ifp;
+		struct vrf *vrf_iter;
 
+		/* br100 may be in a non-default VRF (netns-based setup);
+		 * search all VRFs so the lookup works regardless. */
+		ifp = if_lookup_by_name(bridge, VRF_DEFAULT);
+		if (!ifp)
+			RB_FOREACH(vrf_iter, vrf_id_head, &vrfs_by_id) {
+				ifp = if_lookup_by_name(bridge, vrf_iter->vrf_id);
+				if (ifp)
+					break;
+			}
 		zebra_srv6_evi_set_bridge(evi, bridge, ifp);
 	}
 	VTY_PUSH_CONTEXT(SRV6_L2EVPN_EVI_NODE, evi);
@@ -2271,6 +2275,92 @@ DEFPY (no_srv6_evi_vlan,
 	return CMD_SUCCESS;
 }
 
+DEFPY (srv6_evi_vrf,
+       srv6_evi_vrf_cmd,
+       "vrf WORD$vrfname",
+       "Associate EVI with a tenant VRF\n"
+       "VRF name\n")
+{
+	VTY_DECLVAR_CONTEXT(zebra_srv6_evi, evi);
+	struct vrf *vrf;
+
+	vrf = vrf_lookup_by_name(vrfname);
+	if (!vrf) {
+		vty_out(vty, "%% VRF '%s' not found\n", vrfname);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+	zebra_srv6_evi_set_vrf(evi, vrf->vrf_id);
+	return CMD_SUCCESS;
+}
+
+DEFPY (no_srv6_evi_vrf,
+       no_srv6_evi_vrf_cmd,
+       "no vrf [WORD]",
+       NO_STR
+       "Remove tenant VRF association\n"
+       "VRF name\n")
+{
+	VTY_DECLVAR_CONTEXT(zebra_srv6_evi, evi);
+
+	zebra_srv6_evi_set_vrf(evi, VRF_DEFAULT);
+	return CMD_SUCCESS;
+}
+
+/* Lab helper: inject a static ARP/neighbor entry into an SRv6 EVI so that
+ * zebra generates a MAC+IP Type-2 EVPN route without needing namespace access.
+ * The entry is installed directly into zebra's EVPN neighbor table.
+ */
+DEFPY(srv6_evi_static_neigh,
+      srv6_evi_static_neigh_cmd,
+      "srv6 evi (0-16777215)$vni static-neigh A.B.C.D$ipv4 mac X:X:X:X:X:X$mac",
+      "SRv6\n"
+      "EVI\n"
+      "VNI number\n"
+      "Add static neighbor (ARP) entry for MAC+IP Type-2 advertisement\n"
+      "CE IP address\n"
+      "MAC address keyword\n"
+      "CE MAC address\n")
+{
+	struct zebra_evpn *zevpn;
+	struct interface *br_ifp;
+	struct ipaddr ip;
+	struct ethaddr macaddr;
+
+	zevpn = zebra_evpn_lookup((vni_t)vni);
+	if (!zevpn) {
+		vty_out(vty, "%% No EVPN found for VNI %lld\n", (long long)vni);
+		return CMD_WARNING;
+	}
+
+	br_ifp = zevpn->vxlan_if ? zevpn->vxlan_if : NULL;
+	/* For SRv6 EVIs the bridge itself is the SVI */
+	if (!br_ifp) {
+		struct zebra_srv6_evi *srv6_evi = zebra_srv6_evi_lookup((vni_t)vni);
+		if (srv6_evi && srv6_evi->bridge_if)
+			br_ifp = srv6_evi->bridge_if;
+	}
+	if (!br_ifp) {
+		vty_out(vty, "%% No bridge interface for VNI %lld\n", (long long)vni);
+		return CMD_WARNING;
+	}
+
+	memset(&ip, 0, sizeof(ip));
+	ip.ipa_type = IPADDR_V4;
+	ip.ipaddr_v4 = ipv4;
+
+	if (prefix_str2mac(mac_str, &macaddr) != 1) {
+		vty_out(vty, "%% Invalid MAC address: %s\n", mac_str);
+		return CMD_WARNING;
+	}
+
+	/* Install in kernel and inject into EVPN neighbor table */
+	zebra_srv6_evi_static_neigh_inject(zevpn, br_ifp, &ip, &macaddr);
+
+	vty_out(vty, "Static neighbor %pI4 MAC %s added to VNI %lld\n",
+		&ipv4, mac_str, (long long)vni);
+	return CMD_SUCCESS;
+}
+
 void zebra_srv6_vty_init(void)
 {
 	/* Install nodes and its default commands */
@@ -2318,6 +2408,8 @@ void zebra_srv6_vty_init(void)
 	install_element(SRV6_L2EVPN_EVI_NODE, &no_srv6_evi_l2_encap_mode_cmd);
 	install_element(SRV6_L2EVPN_EVI_NODE, &srv6_evi_vlan_cmd);
 	install_element(SRV6_L2EVPN_EVI_NODE, &no_srv6_evi_vlan_cmd);
+	install_element(SRV6_L2EVPN_EVI_NODE, &srv6_evi_vrf_cmd);
+	install_element(SRV6_L2EVPN_EVI_NODE, &no_srv6_evi_vrf_cmd);
 	install_element(SRV6_LOCS_NODE, &srv6_locator_cmd);
 	install_element(SRV6_LOCS_NODE, &no_srv6_locator_cmd);
 	install_element(SRV6_SID_FORMATS_NODE, &srv6_sid_format_f3216_usid_cmd);
@@ -2378,4 +2470,5 @@ void zebra_srv6_vty_init(void)
 
 	install_element(VIEW_NODE, &show_srv6_sid_counters_cmd);
 	install_element(ENABLE_NODE, &clear_srv6_sid_counters_cmd);
+	install_element(ENABLE_NODE, &srv6_evi_static_neigh_cmd);
 }
