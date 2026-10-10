@@ -159,14 +159,6 @@ struct zebra_srv6_evi {
 	 */
 	char bridge_name[IFNAMSIZ];
 	struct interface *bridge_if; /* VLAN-aware (vlan_filtering) bridge */
-	/*
-	 * Configured bridge name.  The operator may create the bridge AFTER the
-	 * EVI is configured, or zebra may parse its config before the kernel
-	 * interface dump arrives, so bridge_if can be NULL at config time.  Keep
-	 * the name so zebra_srv6_evi_if_add() can bind + realize when the
-	 * interface appears (mirrors VPWS v->bridge_ifname).
-	 */
-	char bridge_ifname[IFNAMSIZ];
 	struct in6_addr dt2u_sid;    /* per-EVI unicast SID */
 	struct in6_addr dt2m_sid;    /* per-EVI BUM SID */
 	bool dt2u_sid_valid;
@@ -267,7 +259,6 @@ extern void zebra_srv6_evi_set_vrf(struct zebra_srv6_evi *evi, vrf_id_t vrf_id);
  */
 extern void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi);
 void zebra_srv6_l2evpn_realize_on_bridge(ifindex_t bridge_ifindex);
-void zebra_srv6_evi_if_add(struct interface *ifp);
 
 /*
  * Handle a remote VTEP/peer BUM (Type-3) update for an SRv6 EVI: create /

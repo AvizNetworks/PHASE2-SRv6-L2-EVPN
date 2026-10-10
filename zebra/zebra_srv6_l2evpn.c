@@ -357,7 +357,13 @@ struct zebra_srv6_evi *zebra_srv6_evi_get_or_create(vni_t vni)
 	evi = XCALLOC(MTYPE_ZEBRA_SRV6_EVI, sizeof(*evi));
 	evi->vni = vni;
 	evi->dp_backend = ZEVPN_DP_SRV6;
-	evi->svc_type = ZEVPN_SVC_VLAN_AWARE_BUNDLE; /* preferred default */
+	/* vlan-aware-bundle is defined for RFC compliance only; the kernel
+	 * dataplane has no implementation for it (rejected if selected
+	 * explicitly - see zebra_srv6_l2evpn_evi_service_type_modify()).
+	 * vlan-based is the only backend the kernel actually supports, so it
+	 * is the safe default.
+	 */
+	evi->svc_type = ZEVPN_SVC_VLAN_BASED;
 	evi->l2_encap_mode = ZEBRA_SR6_ENCAP_MODE_FULL; /* `l2-encap-mode` default */
 	evi->dp_ops = &zevpn_dp_ops_srv6;
 	evi_bds_init(&evi->bds);
@@ -575,11 +581,14 @@ int zebra_srv6_evi_vlan_del(struct zebra_srv6_evi *evi, vlanid_t vid)
 
 void zebra_srv6_evi_set_locator(struct zebra_srv6_evi *evi, const char *locator)
 {
-	if (!evi || !locator)
+	if (!evi)
 		return;
 
-	/* No change → nothing to do. */
-	if (strncmp(evi->locator, locator, sizeof(evi->locator)) == 0)
+	/* No change -> nothing to do.  Covers clearing an already-empty
+	 * locator (locator == NULL) as well as re-setting the same name.
+	 */
+	if (locator ? strncmp(evi->locator, locator, sizeof(evi->locator)) == 0
+		    : evi->locator[0] == '\0')
 		return;
 
 	/*
@@ -615,7 +624,10 @@ void zebra_srv6_evi_set_locator(struct zebra_srv6_evi *evi, const char *locator)
 		evi->dt2m_sid_valid = false;
 	}
 
-	strlcpy(evi->locator, locator, sizeof(evi->locator));
+	if (locator)
+		strlcpy(evi->locator, locator, sizeof(evi->locator));
+	else
+		evi->locator[0] = '\0';
 
 	/*
 	 * Reallocate from the new locator and re-notify bgpd.  Safe to call
@@ -923,41 +935,6 @@ void zebra_srv6_l2evpn_realize_on_bridge(ifindex_t bridge_ifindex)
 			zebra_srv6_evi_realize(evi);
 }
 
-/*
- * Interface-add notification from if_add_update() (see interface.c), mirroring
- * zebra_srv6_vpws_if_add().  The operator may create the EVI's bridge AFTER the
- * EVI is configured, or zebra may parse its config before the kernel interface
- * dump arrives; in either case the `evi ... bridge <br>` command resolved
- * bridge_if to NULL and realize() bailed ("not enough config yet").  Nothing
- * else rebinds it: realize_on_bridge() matches EVIs by evi->bridge_if->ifindex,
- * which is NULL for exactly these EVIs, so they would stay unrealized (no
- * per-EVI DT2U/DT2M SID, no Type-2/Type-3, no L2 dataplane) until a full config
- * re-apply.  When the named bridge finally appears, bind it and realize.
- */
-void zebra_srv6_evi_if_add(struct interface *ifp)
-{
-	struct zebra_srv6_evi *evi;
-
-	if (!srv6_evi_inited || !ifp || ifp->ifindex == 0)
-		return;
-
-	frr_each_safe (srv6_evi_htab, srv6_evi_table, evi) {
-		if (evi->bridge_if)
-			continue; /* already bound */
-		if (evi->bridge_ifname[0] == '\0')
-			continue;
-		if (strncmp(evi->bridge_ifname, ifp->name,
-			    sizeof(evi->bridge_ifname)) != 0)
-			continue;
-
-		evi->bridge_if = ifp;
-		if (IS_ZEBRA_DEBUG_VXLAN)
-			zlog_debug("%s: EVI %u bridge %s (ifindex %u) appeared, realizing",
-				   __func__, evi->vni, ifp->name, ifp->ifindex);
-		zebra_srv6_evi_realize(evi);
-	}
-}
-
 void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 {
 	struct zebra_evpn *zevpn;
@@ -1127,7 +1104,7 @@ void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 	    !if_lookup_by_index_per_ns(zebra_ns_lookup(NS_DEFAULT), evi->local_decap_oif)) {
 		zlog_warn("%s: EVI %u: local decap oif %u no longer exists; will recreate",
 			  __func__, evi->vni, evi->local_decap_oif);
-		zebra_sr6_release(&evi->local_decap_sid);
+		zebra_sr6_release(&evi->local_decap_sid, evi->local_decap_bridge_ifindex, false);
 		memset(&evi->local_decap_sid, 0, sizeof(evi->local_decap_sid));
 		evi->local_decap_oif = 0;
 	}
@@ -1281,6 +1258,7 @@ void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 		evi->self_pvid_bound_vid = zevpn->vid;
 	}
 
+	/*
 	 * Re-program remote SRv6 MAC FDB entries now that the egress sr6 ports
 	 * exist (and, for VLAN-scoped services, are VLAN-bound).  A remote MAC
 	 * received during the earlier window - sr6 port not present yet, so the
