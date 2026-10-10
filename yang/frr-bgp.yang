@@ -883,6 +883,8 @@ module frr-bgp {
       "Augmentation for global L2VPN EVPN AFI-SAFI configuration.";
 
     uses global-evpn-config;
+
+    uses srv6-l2-evpn-config;
   }
 
   augment "/frr-rt:routing/frr-rt:control-plane-protocols/frr-rt:control-plane-protocol/bgp/global/afi-safis/afi-safi/link-state" {

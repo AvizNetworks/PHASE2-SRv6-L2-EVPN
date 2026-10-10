@@ -2011,4 +2011,107 @@ submodule frr-bgp-common {
       }
     }
   }
+
+  grouping srv6-l2-evpn-config {
+    description
+      "Grouping for SRv6 L2 EVPN (VLAN-to-EVI / VPWS) BGP configuration.";
+
+    leaf advertise-srv6-evpn {
+      type boolean;
+      default "false";
+      description
+        "Advertise SRv6-backed L2 EVPN routes (EVI Type-2/Type-3) to peers.
+         Maps to: advertise-srv6-evpn.";
+    }
+
+    leaf advertise-default-gw {
+      type boolean;
+      default "false";
+      description
+        "Advertise the default gateway MAC/IP EVPN route for every SRv6 L2
+         EVPN EVI, unless overridden per-EVI.
+         Maps to: advertise-default-gw.";
+    }
+
+    list evi {
+      key "vni";
+      description
+        "Per-EVI BGP parameters for an SRv6 L2 EVPN Virtual Instance.";
+
+      leaf vni {
+        type uint32 {
+          range "1..16777215";
+        }
+        description
+          "EVI / VNI value; matches the zebra srv6 l2-evpn evi.";
+      }
+
+      uses route-distinguisher-params;
+
+      uses rt-list;
+
+      leaf advertise-default-gw {
+        type boolean;
+        description
+          "Per-EVI override of advertise-default-gw.
+           Maps to: advertise-default-gw (under this EVI).";
+      }
+    }
+
+    list vpws-instance {
+      key "vpws-id";
+      description
+        "SRv6 VPWS pseudowire instance mapped to an SRv6 L2 EVPN EVI.";
+
+      leaf vpws-id {
+        type uint32 {
+          range "1..16777215";
+        }
+        description
+          "VPWS instance identifier.";
+      }
+
+      leaf vpws-evi {
+        type uint32 {
+          range "1..16777215";
+        }
+        description
+          "EVI / VNI this VPWS instance is carried over.";
+      }
+
+      uses route-distinguisher-params;
+
+      uses rt-list;
+
+      leaf interface {
+        type frr-interface:interface-ref;
+        description
+          "Local attachment-circuit interface for this VPWS instance.";
+      }
+
+      choice sid-allocation {
+        description
+          "SRv6 SID allocation mode for this VPWS instance.";
+
+        case automatic {
+          leaf sid-auto {
+            type empty;
+            description
+              "Request automatic SRv6 SID allocation.
+               Maps to: sid-auto.";
+          }
+        }
+        case locator {
+          leaf locator-name {
+            type string {
+              length "1..255";
+            }
+            description
+              "SRv6 locator to allocate this VPWS instance's SID from.
+               Maps to: locator-name.";
+          }
+        }
+      }
+    }
+  }
 }
