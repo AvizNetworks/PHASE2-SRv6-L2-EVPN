@@ -133,6 +133,61 @@ const struct frr_yang_module_info frr_zebra_info = {
 				.modify = zebra_nexthop_group_resilience_unbalanced_timer_modify,
 			}
 		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/l2-mtu",
+			.cbs = {
+				.modify = zebra_srv6_l2evpn_l2_mtu_modify,
+				.destroy = zebra_srv6_l2evpn_l2_mtu_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi",
+			.cbs = {
+				.create = zebra_srv6_l2evpn_evi_create,
+				.destroy = zebra_srv6_l2evpn_evi_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/locator-name",
+			.cbs = {
+				.modify = zebra_srv6_l2evpn_evi_locator_name_modify,
+				.destroy = zebra_srv6_l2evpn_evi_locator_name_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/bridge",
+			.cbs = {
+				.modify = zebra_srv6_l2evpn_evi_bridge_modify,
+				.destroy = zebra_srv6_l2evpn_evi_bridge_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/service-type",
+			.cbs = {
+				.modify = zebra_srv6_l2evpn_evi_service_type_modify,
+			}
+		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/vlan",
+			.cbs = {
+				.create = zebra_srv6_l2evpn_evi_vlan_create,
+				.destroy = zebra_srv6_l2evpn_evi_vlan_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/vrf-name",
+			.cbs = {
+				.modify = zebra_srv6_l2evpn_evi_vrf_name_modify,
+				.destroy = zebra_srv6_l2evpn_evi_vrf_name_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/l2-encap-mode",
+			.cbs = {
+				.modify = zebra_srv6_l2evpn_evi_encap_mode_modify,
+				.destroy = zebra_srv6_l2evpn_evi_encap_mode_destroy,
+			}
+		},
 #if HAVE_BFDD == 0
 		{
 			.xpath = "/frr-zebra:zebra/ptm-enable",

@@ -10,6 +10,7 @@
 #include "if.h"
 #include "prefix.h"
 #include "command.h"
+#include "northbound_cli.h"
 #include "table.h"
 #include "rib.h"
 #include "nexthop.h"
@@ -2064,11 +2065,12 @@ DEFPY (srv6_l2evpn_mtu,
 	 * must carry it plus the SRv6 encap overhead (~78 bytes FULL, ~54
 	 * REDUCED) or frames are dropped/fragmented.
 	 */
-	zebra_sr6_set_mtu((uint32_t)mtu);
-	return CMD_SUCCESS;
+	nb_cli_enqueue_change(vty, "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/l2-mtu",
+			      NB_OP_MODIFY, mtu_str);
+	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (no_srv6_l2evpn_mtu,
+DEFPY_YANG (no_srv6_l2evpn_mtu,
        no_srv6_l2evpn_mtu_cmd,
        "no l2-mtu [(1280-9216)]",
        NO_STR
@@ -2079,11 +2081,12 @@ DEFPY (no_srv6_l2evpn_mtu,
 	 * driver default (1422 on a 1500 underlay).  Existing interfaces keep
 	 * their current MTU until recreated.
 	 */
-	zebra_sr6_set_mtu(ZEBRA_SR6_MTU_UNSET);
-	return CMD_SUCCESS;
+	nb_cli_enqueue_change(vty, "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/l2-mtu",
+                              NB_OP_DESTROY, NULL);
+        return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY_NOSH (srv6_l2evpn_evi,
+DEFPY_YANG_NOSH (srv6_l2evpn_evi,
        srv6_l2evpn_evi_cmd,
        "evi (1-16777215)$vni [locator WORD$locator] [bridge IFNAME$bridge]",
        "EVPN Virtual Instance\n"
@@ -2093,49 +2096,47 @@ DEFPY_NOSH (srv6_l2evpn_evi,
        "VLAN-aware bridge carrying the member VLANs\n"
        "Bridge interface name\n")
 {
-	struct zebra_srv6_evi *evi;
+	char xpath[XPATH_MAXLEN];
+	char xpath_child[XPATH_MAXLEN];
+	int ret;
 
-	evi = zebra_srv6_evi_get_or_create(vni);
-	if (!evi)
-		return CMD_WARNING_CONFIG_FAILED;
-	if (locator)
-		zebra_srv6_evi_set_locator(evi, locator);
-	if (bridge) {
-		struct interface *ifp;
-		struct vrf *vrf_iter;
+	snprintfrr(xpath, sizeof(xpath),
+		   "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi[vni='%s']", vni_str);
+	nb_cli_enqueue_change(vty, xpath, NB_OP_CREATE, NULL);
 
-		/* br100 may be in a non-default VRF (netns-based setup);
-		 * search all VRFs so the lookup works regardless. */
-		ifp = if_lookup_by_name(bridge, VRF_DEFAULT);
-		if (!ifp)
-			RB_FOREACH(vrf_iter, vrf_id_head, &vrfs_by_id) {
-				ifp = if_lookup_by_name(bridge, vrf_iter->vrf_id);
-				if (ifp)
-					break;
-			}
-		if (!ifp)
-			vty_out(vty, "%% bridge interface '%s' not found\n", bridge);
-		zebra_srv6_evi_set_bridge(evi, ifp);
+	if (locator) {
+		snprintfrr(xpath_child, sizeof(xpath_child), "%s/locator-name", xpath);
+		nb_cli_enqueue_change(vty, xpath_child, NB_OP_MODIFY, locator);
 	}
-	VTY_PUSH_CONTEXT(SRV6_L2EVPN_EVI_NODE, evi);
-	return CMD_SUCCESS;
+	if (bridge) {
+		snprintfrr(xpath_child, sizeof(xpath_child), "%s/bridge", xpath);
+		nb_cli_enqueue_change(vty, xpath_child, NB_OP_MODIFY, bridge);
+	}
+
+	ret = nb_cli_apply_changes(vty, NULL);
+	if (ret == CMD_SUCCESS)
+		VTY_PUSH_XPATH(SRV6_L2EVPN_EVI_NODE, xpath);
+
+	return ret;
 }
 
-DEFPY (no_srv6_l2evpn_evi,
+DEFPY_YANG (no_srv6_l2evpn_evi,
        no_srv6_l2evpn_evi_cmd,
        "no evi (1-16777215)$vni",
        NO_STR
        "EVPN Virtual Instance\n"
        "EVI / BD value\n")
 {
-	struct zebra_srv6_evi *evi = zebra_srv6_evi_lookup(vni);
+	char xpath[XPATH_MAXLEN];
 
-	if (evi)
-		zebra_srv6_evi_del(evi);
-	return CMD_SUCCESS;
+	snprintfrr(xpath, sizeof(xpath),
+		   "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi[vni='%s']", vni_str);
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+
+	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (srv6_evi_service_type,
+DEFPY_YANG (srv6_evi_service_type,
        srv6_evi_service_type_cmd,
        "service-type <vlan-aware-bundle|vlan-based|vlan-bundle>$svc",
        "L2 service type\n"
@@ -2143,56 +2144,22 @@ DEFPY (srv6_evi_service_type,
        "VLAN-based: one VLAN per EVI, Ethernet-Tag=0\n"
        "VLAN bundle: N VLANs collapsed into one BD, Ethernet-Tag=0\n")
 {
-	VTY_DECLVAR_CONTEXT(zebra_srv6_evi, evi);
-	enum zevpn_l2_service s;
-
-	if (zevpn_l2_service_str2enum(svc, &s) < 0) {
-		vty_out(vty, "%% invalid service-type\n");
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-
-	if (s == ZEVPN_SVC_VLAN_AWARE_BUNDLE) {
-		vty_out(vty, "%% vlan-aware-bundle not implemented\n");
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-
-	/*
-	 * vlan-based is a single-VLAN-per-EVI service.  Reject the switch if the
-	 * EVI already has more than one member VLAN, otherwise the extra members
-	 * would be silently orphaned.  vlan-bundle / vlan-aware-bundle accept any
-	 * number of members, so no cap there.
-	 */
-	if (s == ZEVPN_SVC_VLAN_BASED && evi_bds_count(&evi->bds) > 1) {
-		vty_out(vty,
-			"%% vlan-based allows only one VLAN per EVI; EVI %u has %zu members — remove members first\n",
-			evi->vni, evi_bds_count(&evi->bds));
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-
-	if (zebra_srv6_evi_set_service(evi, s) < 0) {
-		vty_out(vty,
-			"%% service-type cannot be changed once set (vlan-bundle vs vlan-based/aware need different bridge models); delete and recreate EVI %u bound to a matching bridge\n",
-			evi->vni);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-	return CMD_SUCCESS;
+	nb_cli_enqueue_change(vty, "./service-type", NB_OP_MODIFY, svc);
+	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (srv6_evi_l2_encap_mode,
+DEFPY_YANG (srv6_evi_l2_encap_mode,
        srv6_evi_l2_encap_mode_cmd,
        "l2-encap-mode <full|reduced>$mode",
        "SRv6 L2 encapsulation mode for this EVI's sr6 tunnel interfaces\n"
        "Full: H.Encaps.L2 - keep the SRH on the wire (default)\n"
        "Reduced: H.Encaps.L2.Red - single SID in the outer IPv6 DA, no SRH\n")
 {
-	VTY_DECLVAR_CONTEXT(zebra_srv6_evi, evi);
-
-	zebra_srv6_evi_set_encap_mode(evi, strmatch(mode, "reduced") ? ZEBRA_SR6_ENCAP_MODE_REDUCED
-								     : ZEBRA_SR6_ENCAP_MODE_FULL);
-	return CMD_SUCCESS;
+	nb_cli_enqueue_change(vty, "./l2-encap-mode", NB_OP_MODIFY, mode);
+	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (no_srv6_evi_l2_encap_mode,
+DEFPY_YANG (no_srv6_evi_l2_encap_mode,
        no_srv6_evi_l2_encap_mode_cmd,
        "no l2-encap-mode [<full|reduced>]",
        NO_STR
@@ -2200,70 +2167,58 @@ DEFPY (no_srv6_evi_l2_encap_mode,
        "Full: H.Encaps.L2 - keep the SRH on the wire (default)\n"
        "Reduced: H.Encaps.L2.Red - single SID in the outer IPv6 DA, no SRH\n")
 {
-	VTY_DECLVAR_CONTEXT(zebra_srv6_evi, evi);
-
-	/* Revert to the default (full). */
-	zebra_srv6_evi_set_encap_mode(evi, ZEBRA_SR6_ENCAP_MODE_FULL);
-	return CMD_SUCCESS;
+	nb_cli_enqueue_change(vty, "./l2-encap-mode", NB_OP_DESTROY, NULL);
+	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (srv6_evi_vlan,
+DEFPY_YANG (srv6_evi_vlan,
        srv6_evi_vlan_cmd,
        "vlan (1-4094)$vid",
        "Member VLAN mapped into this EVI\n"
        "VLAN ID\n")
 {
-	VTY_DECLVAR_CONTEXT(zebra_srv6_evi, evi);
+	char xpath[XPATH_MAXLEN];
 
-	if (!zebra_srv6_evi_vlan_add(evi, vid)) {
-		vty_out(vty, "%% failed to add vlan %ld to evi %u\n", (long)vid, evi->vni);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-	return CMD_SUCCESS;
+	snprintfrr(xpath, sizeof(xpath), "./vlan[.='%s']", vid_str);
+	nb_cli_enqueue_change(vty, xpath, NB_OP_CREATE, NULL);
+
+	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (no_srv6_evi_vlan,
+DEFPY_YANG (no_srv6_evi_vlan,
        no_srv6_evi_vlan_cmd,
        "no vlan (1-4094)$vid",
        NO_STR
        "Member VLAN mapped into this EVI\n"
        "VLAN ID\n")
 {
-	VTY_DECLVAR_CONTEXT(zebra_srv6_evi, evi);
+	char xpath[XPATH_MAXLEN];
 
-	zebra_srv6_evi_vlan_del(evi, vid);
-	return CMD_SUCCESS;
+	snprintfrr(xpath, sizeof(xpath), "./vlan[.='%s']", vid_str);
+	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+
+	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (srv6_evi_vrf,
+DEFPY_YANG (srv6_evi_vrf,
        srv6_evi_vrf_cmd,
        "vrf WORD$vrfname",
        "Associate EVI with a tenant VRF\n"
        "VRF name\n")
 {
-	VTY_DECLVAR_CONTEXT(zebra_srv6_evi, evi);
-	struct vrf *vrf;
-
-	vrf = vrf_lookup_by_name(vrfname);
-	if (!vrf) {
-		vty_out(vty, "%% VRF '%s' not found\n", vrfname);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-	zebra_srv6_evi_set_vrf(evi, vrf->vrf_id);
-	return CMD_SUCCESS;
+	nb_cli_enqueue_change(vty, "./vrf-name", NB_OP_MODIFY, vrfname);
+	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (no_srv6_evi_vrf,
+DEFPY_YANG (no_srv6_evi_vrf,
        no_srv6_evi_vrf_cmd,
        "no vrf [WORD]",
        NO_STR
        "Remove tenant VRF association\n"
        "VRF name\n")
 {
-	VTY_DECLVAR_CONTEXT(zebra_srv6_evi, evi);
-
-	zebra_srv6_evi_set_vrf(evi, VRF_DEFAULT);
-	return CMD_SUCCESS;
+	nb_cli_enqueue_change(vty, "./vrf-name", NB_OP_DESTROY, NULL);
+	return nb_cli_apply_changes(vty, NULL);
 }
 
 /* Lab helper: inject a static ARP/neighbor entry into an SRv6 EVI so that

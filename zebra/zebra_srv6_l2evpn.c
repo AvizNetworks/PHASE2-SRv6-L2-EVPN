@@ -356,7 +356,13 @@ struct zebra_srv6_evi *zebra_srv6_evi_get_or_create(vni_t vni)
 	evi = XCALLOC(MTYPE_ZEBRA_SRV6_EVI, sizeof(*evi));
 	evi->vni = vni;
 	evi->dp_backend = ZEVPN_DP_SRV6;
-	evi->svc_type = ZEVPN_SVC_VLAN_AWARE_BUNDLE; /* preferred default */
+	/* vlan-aware-bundle is defined for RFC compliance only; the kernel
+	 * dataplane has no implementation for it (rejected if selected
+	 * explicitly - see zebra_srv6_l2evpn_evi_service_type_modify()).
+	 * vlan-based is the only backend the kernel actually supports, so it
+	 * is the safe default.
+	 */
+	evi->svc_type = ZEVPN_SVC_VLAN_BASED;
 	evi->l2_encap_mode = ZEBRA_SR6_ENCAP_MODE_FULL; /* `l2-encap-mode` default */
 	evi->dp_ops = &zevpn_dp_ops_srv6;
 	evi_bds_init(&evi->bds);
@@ -535,11 +541,14 @@ int zebra_srv6_evi_vlan_del(struct zebra_srv6_evi *evi, vlanid_t vid)
 
 void zebra_srv6_evi_set_locator(struct zebra_srv6_evi *evi, const char *locator)
 {
-	if (!evi || !locator)
+	if (!evi)
 		return;
 
-	/* No change → nothing to do. */
-	if (strncmp(evi->locator, locator, sizeof(evi->locator)) == 0)
+	/* No change -> nothing to do.  Covers clearing an already-empty
+	 * locator (locator == NULL) as well as re-setting the same name.
+	 */
+	if (locator ? strncmp(evi->locator, locator, sizeof(evi->locator)) == 0
+		    : evi->locator[0] == '\0')
 		return;
 
 	/*
@@ -575,7 +584,10 @@ void zebra_srv6_evi_set_locator(struct zebra_srv6_evi *evi, const char *locator)
 		evi->dt2m_sid_valid = false;
 	}
 
-	strlcpy(evi->locator, locator, sizeof(evi->locator));
+	if (locator)
+		strlcpy(evi->locator, locator, sizeof(evi->locator));
+	else
+		evi->locator[0] = '\0';
 
 	/*
 	 * Reallocate from the new locator and re-notify bgpd.  Safe to call

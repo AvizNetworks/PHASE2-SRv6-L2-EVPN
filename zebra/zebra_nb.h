@@ -59,6 +59,24 @@ int zebra_nexthop_group_resilience_idle_timer_modify(
 	struct nb_cb_modify_args *args);
 int zebra_nexthop_group_resilience_unbalanced_timer_modify(
 	struct nb_cb_modify_args *args);
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn
+ */
+int zebra_srv6_l2evpn_l2_mtu_modify(struct nb_cb_modify_args *args);
+int zebra_srv6_l2evpn_l2_mtu_destroy(struct nb_cb_destroy_args *args);
+int zebra_srv6_l2evpn_evi_create(struct nb_cb_create_args *args);
+int zebra_srv6_l2evpn_evi_destroy(struct nb_cb_destroy_args *args);
+int zebra_srv6_l2evpn_evi_locator_name_modify(struct nb_cb_modify_args *args);
+int zebra_srv6_l2evpn_evi_locator_name_destroy(struct nb_cb_destroy_args *args);
+int zebra_srv6_l2evpn_evi_bridge_modify(struct nb_cb_modify_args *args);
+int zebra_srv6_l2evpn_evi_bridge_destroy(struct nb_cb_destroy_args *args);
+int zebra_srv6_l2evpn_evi_service_type_modify(struct nb_cb_modify_args *args);
+int zebra_srv6_l2evpn_evi_vlan_create(struct nb_cb_create_args *args);
+int zebra_srv6_l2evpn_evi_vlan_destroy(struct nb_cb_destroy_args *args);
+int zebra_srv6_l2evpn_evi_vrf_name_modify(struct nb_cb_modify_args *args);
+int zebra_srv6_l2evpn_evi_vrf_name_destroy(struct nb_cb_destroy_args *args);
+int zebra_srv6_l2evpn_evi_encap_mode_modify(struct nb_cb_modify_args *args);
+int zebra_srv6_l2evpn_evi_encap_mode_destroy(struct nb_cb_destroy_args *args);
 #if HAVE_BFDD == 0
 int zebra_ptm_enable_modify(struct nb_cb_modify_args *args);
 #endif

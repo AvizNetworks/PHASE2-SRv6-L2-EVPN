@@ -3177,6 +3177,121 @@ module frr-zebra {
       description
         "Limit on the number of updates queued to the dataplane subsystem.";
     }
+    container segment-routing {
+      description
+        "Segment Routing configuration.";
+      container srv6 {
+        description
+          "Segment Routing over IPv6 (SRv6) configuration.";
+        container l2-evpn {
+          description
+            "SRv6 L2 EVPN (VLAN-to-EVI mapping) configuration.";
+          leaf l2-mtu {
+            type uint32 {
+              range "1280..9216";
+            }
+            description
+              "MTU applied to sr6 tunnel interfaces (for jumbo-frame L2
+               EVPN). Applied at sr6 interface-create time and pushed
+               live onto existing interfaces. The underlay path must
+               carry this value plus the SRv6 encapsulation overhead
+               (~78 bytes full, ~54 bytes reduced) or frames are
+               dropped/fragmented. When unset, new sr6 interfaces fall
+               back to the kernel sr6 driver default.";
+          }
+          list evi {
+            key "vni";
+            description
+              "SRv6 L2 EVPN Virtual Instance (EVI): a VLAN-to-EVI mapping
+               realized on an SRv6 locator.";
+            must "service-type != 'vlan-based' or count(vlan) <= 1" {
+              error-message
+                "A vlan-based EVI accepts only one VLAN.";
+            }
+            leaf vni {
+              type uint32 {
+                range "1..16777215";
+              }
+              description
+                "EVI / VNI value.";
+            }
+            leaf locator-name {
+              type string {
+                length "1..255";
+              }
+              description
+                "SRv6 locator this EVI's service SIDs are allocated
+                 from.";
+            }
+            leaf bridge {
+              type string;
+              description
+                "VLAN-aware bridge interface carrying this EVI's member
+                 VLANs.";
+            }
+            leaf service-type {
+              type enumeration {
+                enum vlan-aware-bundle {
+                  description
+                    "N VLANs in one EVI; per-VLAN bridge-domain/FDB;
+                     Ethernet Tag ID = VLAN.  Defined for RFC
+                     compliance only: the kernel dataplane has no
+                     implementation for this service type and rejects
+                     it if selected.";
+                }
+                enum vlan-based {
+                  description
+                    "One VLAN per EVI; Ethernet Tag ID = 0.  The only
+                     service type the kernel dataplane currently
+                     implements.";
+                }
+                enum vlan-bundle {
+                  description
+                    "N VLANs collapsed into one bridge-domain/FDB;
+                     Ethernet Tag ID = 0.";
+                }
+              }
+              default "vlan-based";
+              description
+                "L2 service type for this EVI. Immutable once set:
+                 changing it would require a different Linux bridge
+                 model, so the EVI must be deleted and recreated
+                 instead.";
+            }
+            leaf-list vlan {
+              type uint16 {
+                range "1..4094";
+              }
+              description
+                "Member VLAN IDs mapped into this EVI.";
+            }
+            leaf vrf-name {
+              type frr-vrf:vrf-ref;
+              description
+                "Tenant VRF associated with this EVI.";
+            }
+            leaf l2-encap-mode {
+              type enumeration {
+                enum full {
+                  description
+                    "Keep the Segment Routing Header on the wire
+                     (default).";
+                }
+                enum reduced {
+                  description
+                    "Single-SID H.Encaps.L2.Red: SID in the outer IPv6
+                     DA, no SRH.";
+                }
+              }
+              default "full";
+              description
+                "SRv6 L2 (sr6) encapsulation mode applied to this EVI's
+                 sr6 tunnel interfaces.";
+            }
+          }
+        }
+      }
+    }
     container nexthop-group {
       description
         "Global nexthop group configuration.";

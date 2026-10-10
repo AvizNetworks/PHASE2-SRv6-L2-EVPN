@@ -32,6 +32,9 @@
 #include "zebra/table_manager.h"
 #include "zebra/ipforward.h"
 #include "zebra/zebra_nhg.h"
+#include "lib/vrf.h"
+#include "zebra/zebra_srv6_l2evpn.h"
+#include "zebra/zebra_sr6.h"
 
 /*
  * XPath: /frr-zebra:zebra/ip-forwarding
@@ -329,6 +332,358 @@ int zebra_nexthop_group_resilience_unbalanced_timer_modify(
 	struct nb_cb_modify_args *args)
 {
 	/* handled in apply_finish callback of the parent node */
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/l2-encap-mode
+ */
+int zebra_srv6_l2evpn_evi_encap_mode_modify(struct nb_cb_modify_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	const char *mode;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	evi = zebra_srv6_evi_lookup(yang_dnode_get_uint32(args->dnode, "../vni"));
+	if (!evi)
+		return NB_ERR;
+
+	mode = yang_dnode_get_string(args->dnode, NULL);
+	zebra_srv6_evi_set_encap_mode(evi, strmatch(mode, "reduced") ? ZEBRA_SR6_ENCAP_MODE_REDUCED
+								     : ZEBRA_SR6_ENCAP_MODE_FULL);
+
+	return NB_OK;
+}
+
+int zebra_srv6_l2evpn_evi_encap_mode_destroy(struct nb_cb_destroy_args *args)
+{
+	struct zebra_srv6_evi *evi;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	evi = zebra_srv6_evi_lookup(yang_dnode_get_uint32(args->dnode, "../vni"));
+	if (evi)
+		zebra_srv6_evi_set_encap_mode(evi, ZEBRA_SR6_ENCAP_MODE_FULL);
+
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/l2-mtu
+ */
+int zebra_srv6_l2evpn_l2_mtu_modify(struct nb_cb_modify_args *args)
+{
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	zebra_sr6_set_mtu(yang_dnode_get_uint32(args->dnode, NULL));
+
+	return NB_OK;
+}
+
+int zebra_srv6_l2evpn_l2_mtu_destroy(struct nb_cb_destroy_args *args)
+{
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	zebra_sr6_set_mtu(ZEBRA_SR6_MTU_UNSET);
+
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi
+ */
+int zebra_srv6_l2evpn_evi_create(struct nb_cb_create_args *args)
+{
+	vni_t vni;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	vni = yang_dnode_get_uint32(args->dnode, "vni");
+	if (!zebra_srv6_evi_get_or_create(vni))
+		return NB_ERR;
+
+	return NB_OK;
+}
+
+int zebra_srv6_l2evpn_evi_destroy(struct nb_cb_destroy_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	vni_t vni;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	vni = yang_dnode_get_uint32(args->dnode, "vni");
+	evi = zebra_srv6_evi_lookup(vni);
+	if (evi)
+		zebra_srv6_evi_del(evi);
+
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/locator-name
+ */
+int zebra_srv6_l2evpn_evi_locator_name_modify(struct nb_cb_modify_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	vni_t vni;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	vni = yang_dnode_get_uint32(args->dnode, "../vni");
+	evi = zebra_srv6_evi_lookup(vni);
+	if (!evi)
+		return NB_ERR;
+
+	zebra_srv6_evi_set_locator(evi, yang_dnode_get_string(args->dnode, NULL));
+
+	return NB_OK;
+}
+
+int zebra_srv6_l2evpn_evi_locator_name_destroy(struct nb_cb_destroy_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	vni_t vni;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	vni = yang_dnode_get_uint32(args->dnode, "../vni");
+	evi = zebra_srv6_evi_lookup(vni);
+	if (evi)
+		zebra_srv6_evi_set_locator(evi, NULL);
+
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/bridge
+ */
+static struct interface *zebra_srv6_l2evpn_bridge_resolve(const char *bridge)
+{
+	struct interface *ifp;
+	struct vrf *vrf_iter;
+
+	/* The bridge may live in a non-default VRF (netns-based setup);
+	 * search all VRFs so the lookup works regardless.
+	 */
+	ifp = if_lookup_by_name(bridge, VRF_DEFAULT);
+	if (!ifp)
+		RB_FOREACH (vrf_iter, vrf_id_head, &vrfs_by_id) {
+			ifp = if_lookup_by_name(bridge, vrf_iter->vrf_id);
+			if (ifp)
+				break;
+		}
+
+	return ifp;
+}
+
+int zebra_srv6_l2evpn_evi_bridge_modify(struct nb_cb_modify_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	const char *bridge = yang_dnode_get_string(args->dnode, NULL);
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+		/*
+		 * Operator-owned bridge model: the operator may create the bridge
+		 * AFTER configuring the EVI, and at daemon startup zebra may parse
+		 * its config before the kernel interface dump has delivered the
+		 * bridge.  Do NOT reject an as-yet-unresolved bridge here -- that
+		 * would drop the whole EVI config (and, in a combined candidate,
+		 * its sibling evi/locator-name changes).  zebra_srv6_evi_if_add()
+		 * binds + realizes the EVI when the named bridge appears, mirroring
+		 * the VPWS deferral (zebra_srv6_vpws_if_add).
+		 */
+		break;
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		evi = zebra_srv6_evi_lookup(yang_dnode_get_uint32(args->dnode, "../vni"));
+		if (!evi)
+			return NB_ERR;
+		/*
+		 * Remember the configured bridge name so zebra_srv6_evi_if_add()
+		 * can bind + realize when the bridge appears later: resolve returns
+		 * NULL here, set_bridge stores NULL, and realize() bails until then.
+		 */
+		strlcpy(evi->bridge_ifname, bridge, sizeof(evi->bridge_ifname));
+		zebra_srv6_evi_set_bridge(evi, zebra_srv6_l2evpn_bridge_resolve(bridge));
+		break;
+	}
+
+	return NB_OK;
+}
+
+int zebra_srv6_l2evpn_evi_bridge_destroy(struct nb_cb_destroy_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	vni_t vni;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	vni = yang_dnode_get_uint32(args->dnode, "../vni");
+	evi = zebra_srv6_evi_lookup(vni);
+	if (evi) {
+		evi->bridge_ifname[0] = '\0';
+		zebra_srv6_evi_set_bridge(evi, NULL);
+	}
+
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/service-type
+ */
+int zebra_srv6_l2evpn_evi_service_type_modify(struct nb_cb_modify_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	enum zevpn_l2_service svc;
+	const char *value = yang_dnode_get_string(args->dnode, NULL);
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+		/* Pure string validation, no backend state involved -- safe to
+		 * run before anything in this transaction is applied.
+		 */
+		if (zevpn_l2_service_str2enum(value, &svc) < 0) {
+			snprintfrr(args->errmsg, args->errmsg_len, "invalid service-type '%s'",
+				   value);
+			return NB_ERR_VALIDATION;
+		}
+		if (svc == ZEVPN_SVC_VLAN_AWARE_BUNDLE) {
+			snprintfrr(args->errmsg, args->errmsg_len,
+				   "vlan-aware-bundle not implemented");
+			return NB_ERR_VALIDATION;
+		}
+		break;
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		evi = zebra_srv6_evi_lookup(yang_dnode_get_uint32(args->dnode, "../vni"));
+		if (!evi)
+			return NB_ERR;
+
+		zevpn_l2_service_str2enum(value, &svc);
+		if (zebra_srv6_evi_set_service(evi, svc) < 0) {
+			snprintfrr(args->errmsg, args->errmsg_len,
+				   "service-type cannot be changed once set (vlan-bundle vs vlan-based/aware need different bridge models); delete and recreate EVI %u bound to a matching bridge",
+				   evi->vni);
+			return NB_ERR_VALIDATION;
+		}
+		break;
+	}
+
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/vlan
+ */
+int zebra_srv6_l2evpn_evi_vlan_create(struct nb_cb_create_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	vni_t vni;
+	uint16_t vid;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	vni = yang_dnode_get_uint32(args->dnode, "../vni");
+	evi = zebra_srv6_evi_lookup(vni);
+	if (!evi)
+		return NB_ERR;
+
+	vid = yang_dnode_get_uint16(args->dnode, NULL);
+	if (!zebra_srv6_evi_vlan_add(evi, vid)) {
+		snprintfrr(args->errmsg, args->errmsg_len, "failed to add vlan %u to EVI %u", vid,
+			   evi->vni);
+		return NB_ERR;
+	}
+
+	return NB_OK;
+}
+
+int zebra_srv6_l2evpn_evi_vlan_destroy(struct nb_cb_destroy_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	vni_t vni;
+	uint16_t vid;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	vni = yang_dnode_get_uint32(args->dnode, "../vni");
+	evi = zebra_srv6_evi_lookup(vni);
+	if (!evi)
+		return NB_OK;
+
+	vid = yang_dnode_get_uint16(args->dnode, NULL);
+	zebra_srv6_evi_vlan_del(evi, vid);
+
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/vrf-name
+ */
+int zebra_srv6_l2evpn_evi_vrf_name_modify(struct nb_cb_modify_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	struct vrf *vrf;
+	const char *vrfname = yang_dnode_get_string(args->dnode, NULL);
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+		/* See zebra_srv6_l2evpn_evi_bridge_modify() for why this must
+		 * run at VALIDATE rather than APPLY.
+		 */
+		if (!vrf_lookup_by_name(vrfname)) {
+			snprintfrr(args->errmsg, args->errmsg_len, "VRF '%s' not found", vrfname);
+			return NB_ERR_VALIDATION;
+		}
+		break;
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		evi = zebra_srv6_evi_lookup(yang_dnode_get_uint32(args->dnode, "../vni"));
+		if (!evi)
+			return NB_ERR;
+		vrf = vrf_lookup_by_name(vrfname);
+		if (!vrf)
+			return NB_ERR;
+		zebra_srv6_evi_set_vrf(evi, vrf->vrf_id);
+		break;
+	}
+
+	return NB_OK;
+}
+
+int zebra_srv6_l2evpn_evi_vrf_name_destroy(struct nb_cb_destroy_args *args)
+{
+	struct zebra_srv6_evi *evi;
+	vni_t vni;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	vni = yang_dnode_get_uint32(args->dnode, "../vni");
+	evi = zebra_srv6_evi_lookup(vni);
+	if (evi)
+		zebra_srv6_evi_set_vrf(evi, VRF_DEFAULT);
+
 	return NB_OK;
 }
 
