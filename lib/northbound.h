@@ -115,6 +115,18 @@ enum nb_error {
 	NB_ERR_RESOURCE,
 	NB_ERR_INCONSISTENCY,
 	NB_YIELD,
+	/*
+	 * Distinct from NB_ERR_LOCKED: this is the transient case where
+	 * transaction_in_progress was already true (e.g. mgmtd is mid-way
+	 * through its own two-phase CFG_REQ/CFG_APPLY_REQ push to this
+	 * daemon), as opposed to nb_running_lock_check() failing because
+	 * another client genuinely holds the running-config lock. The
+	 * transient case is expected to clear on its own shortly - callers
+	 * that care should retry (asynchronously - see the note on
+	 * nb_candidate_commit() below) instead of discarding the candidate
+	 * outright.
+	 */
+	NB_ERR_TRANSACTION_IN_PROGRESS,
 };
 
 union nb_resource {
@@ -1378,7 +1390,16 @@ extern int nb_candidate_validate(struct nb_context *context,
  *    - NB_OK on success.
  *    - NB_ERR_NO_CHANGES when the candidate is identical to the running
  *      configuration.
- *    - NB_ERR_LOCKED when there's already another transaction in progress.
+ *    - NB_ERR_LOCKED when the running configuration is locked by another
+ *      client.
+ *    - NB_ERR_TRANSACTION_IN_PROGRESS when another transaction is
+ *      transiently in progress on this daemon (e.g. mgmtd mid-way through
+ *      its own two-phase push) - expected to clear shortly. Callers that
+ *      want to retry rather than fail immediately MUST NOT do so with a
+ *      blocking wait: the message that clears the collision (mgmtd's
+ *      CFG_APPLY_REQ) is delivered on this same event loop, so a blocking
+ *      retry can never observe it. Retry via event_add_timer() instead -
+ *      see frr_config_commit_attempt() in lib/libfrr.c for the pattern.
  *    - NB_ERR_VALIDATION when the candidate fails the validation checks.
  *    - NB_ERR_RESOURCE when the system fails to allocate resources to apply
  *      the candidate configuration.
@@ -1478,7 +1499,16 @@ extern void nb_candidate_commit_apply(struct nb_transaction *transaction,
  *    - NB_OK on success.
  *    - NB_ERR_NO_CHANGES when the candidate is identical to the running
  *      configuration.
- *    - NB_ERR_LOCKED when there's already another transaction in progress.
+ *    - NB_ERR_LOCKED when the running configuration is locked by another
+ *      client.
+ *    - NB_ERR_TRANSACTION_IN_PROGRESS when another transaction is
+ *      transiently in progress on this daemon (e.g. mgmtd mid-way through
+ *      its own two-phase push) - expected to clear shortly. Callers that
+ *      want to retry rather than fail immediately MUST NOT do so with a
+ *      blocking wait: the message that clears the collision (mgmtd's
+ *      CFG_APPLY_REQ) is delivered on this same event loop, so a blocking
+ *      retry can never observe it. Retry via event_add_timer() instead -
+ *      see frr_config_commit_attempt() in lib/libfrr.c for the pattern.
  *    - NB_ERR_VALIDATION when the candidate fails the validation checks.
  *    - NB_ERR_RESOURCE when the system fails to allocate resources to apply
  *      the candidate configuration.

@@ -48,6 +48,103 @@ static void vty_show_nb_errors(struct vty *vty, int error, const char *errmsg)
 		vty_out(vty, "Error description: %s\n", errmsg);
 }
 
+/*
+ * NB_ERR_TRANSACTION_IN_PROGRESS means some other local commit source (most
+ * commonly mgmtd's own two-phase push to this same daemon) is transiently
+ * holding the northbound transaction lock and is expected to release it
+ * shortly - it is not a genuinely held lock. Discarding the whole candidate
+ * batch on this specific transient failure (the pre-existing behavior below)
+ * turns a self-resolving race into permanent config loss, so retry instead.
+ *
+ * The retry can't be a blocking wait: the message that actually clears the
+ * collision (mgmtd's CFG_APPLY_REQ, if that's the colliding party) is
+ * delivered on this same event loop, so blocking would prevent the loop
+ * from ever seeing it. It has to be deferred via event_add_timer_msec() -
+ * which means this DEFUN-reachable function needs to be able to return to
+ * its caller (cmd_execute() -> vty_execute() -> vty_read()) without a final
+ * CMD_* result yet. That's exactly what vty->mgmt_req_pending_cmd already
+ * exists for (see the same pattern in mgmtd/mgmt_vty_frontend.c and
+ * vty_read()'s explicit check for it before writing the response
+ * terminator) - it's a real, already-in-production "return now, respond
+ * later" mechanism, not something invented for this fix. vty_resume_response()
+ * sends the deferred terminator once the retry resolves.
+ */
+#define NB_CLI_COMMIT_RETRY_MAX 5
+#define NB_CLI_COMMIT_RETRY_INTERVAL_MSEC 50
+
+struct nb_cli_commit_retry_ctx {
+	struct vty *vty;
+	int retries_left;
+};
+
+static void nb_cli_classic_commit_finish(struct vty *vty, int ret, char *errmsg)
+{
+	int cmd_ret;
+
+	switch (ret) {
+	case NB_OK:
+		/* Successful commit. Print warnings (if any). */
+		if (strlen(errmsg) > 0)
+			vty_out(vty, "%s\n", errmsg);
+		cmd_ret = CMD_SUCCESS;
+		break;
+	case NB_ERR_NO_CHANGES:
+		cmd_ret = CMD_SUCCESS;
+		break;
+	default:
+		vty_out(vty, "%% Configuration failed.\n\n");
+		vty_show_nb_errors(vty, ret, errmsg);
+		if (vty->pending_commit)
+			vty_out(vty,
+				"The following commands were dynamically grouped into the same transaction and rejected:\n%s",
+				vty->pending_cmds_buf);
+
+		/* Regenerate candidate for consistency. */
+		nb_config_replace(vty->candidate_config, running_config, true);
+		cmd_ret = CMD_WARNING_CONFIG_FAILED;
+		break;
+	}
+
+	if (vty->mgmt_req_pending_cmd) {
+		vty->mgmt_req_pending_cmd = NULL;
+		vty_resume_response(vty, cmd_ret);
+	}
+}
+
+static void nb_cli_classic_commit_retry(struct event *t)
+{
+	struct nb_cli_commit_retry_ctx *ctx = EVENT_ARG(t);
+	struct nb_context context = {};
+	char errmsg[BUFSIZ] = {0};
+	int ret;
+
+	/*
+	 * The party we collided with last time may have gone on to commit
+	 * this same config itself while we were waiting to retry, leaving
+	 * our candidate's diff stale against the current running_config.
+	 * Rebase first so a retry after a since-successful competing apply
+	 * is a no-op instead of replaying already-applied creates as
+	 * destroy+recreate. See frr_config_commit_attempt() in libfrr.c.
+	 */
+	if (nb_candidate_needs_update(ctx->vty->candidate_config))
+		nb_candidate_update(ctx->vty->candidate_config);
+
+	context.client = NB_CLIENT_CLI;
+	context.user = ctx->vty;
+	ret = nb_candidate_commit(context, ctx->vty->candidate_config, true,
+				  NULL, NULL, errmsg, sizeof(errmsg));
+
+	if (ret == NB_ERR_TRANSACTION_IN_PROGRESS && ctx->retries_left > 0) {
+		ctx->retries_left--;
+		event_add_timer_msec(vty_get_master(), nb_cli_classic_commit_retry,
+				     ctx, NB_CLI_COMMIT_RETRY_INTERVAL_MSEC, NULL);
+		return;
+	}
+
+	nb_cli_classic_commit_finish(ctx->vty, ret, errmsg);
+	XFREE(MTYPE_TMP, ctx);
+}
+
 static int nb_cli_classic_commit(struct vty *vty)
 {
 	struct nb_context context = {};
@@ -58,6 +155,23 @@ static int nb_cli_classic_commit(struct vty *vty)
 	context.user = vty;
 	ret = nb_candidate_commit(context, vty->candidate_config, true, NULL,
 				  NULL, errmsg, sizeof(errmsg));
+
+	if (ret == NB_ERR_TRANSACTION_IN_PROGRESS) {
+		struct nb_cli_commit_retry_ctx *ctx =
+			XMALLOC(MTYPE_TMP, sizeof(*ctx));
+
+		ctx->vty = vty;
+		ctx->retries_left = NB_CLI_COMMIT_RETRY_MAX;
+		/* Defer the response; vty_read() checks this flag right after
+		 * this function returns and skips writing the terminator
+		 * when it's set, regardless of the CMD_* value we return
+		 * below - see the long comment above. */
+		vty->mgmt_req_pending_cmd = "NB_CLI_CLASSIC_COMMIT_RETRY";
+		event_add_timer_msec(vty_get_master(), nb_cli_classic_commit_retry,
+				     ctx, NB_CLI_COMMIT_RETRY_INTERVAL_MSEC, NULL);
+		return CMD_SUCCESS;
+	}
+
 	switch (ret) {
 	case NB_OK:
 		/* Successful commit. Print warnings (if any). */

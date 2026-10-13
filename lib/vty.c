@@ -103,6 +103,16 @@ static int vtysh_flush(struct vty *vty);
 /* Extern host structure from command.c */
 extern struct host host;
 
+/* Moved up from its old file-local spot (was declared right before
+ * vty_init()) so vty_read_file_finish()'s async commit-retry, earlier in
+ * this file, can reference it too. */
+static struct event_loop *vty_master;
+
+struct event_loop *vty_get_master(void)
+{
+	return vty_master;
+}
+
 /* active listeners */
 static struct vtyservs_head vty_servs[1] = {INIT_DLIST(vty_servs[0])};
 
@@ -2556,6 +2566,68 @@ void vty_read_file(struct nb_config *config, FILE *confp)
 	vty_read_file_finish(vty, config);
 }
 
+/*
+ * Async commit-retry state for the config-file auto-commit below. See the
+ * long comment at frr_config_commit_attempt() in lib/libfrr.c for why this
+ * has to be a deferred event_add_timer() retry rather than a blocking wait:
+ * the message that clears a transient NB_ERR_TRANSACTION_IN_PROGRESS
+ * collision (mgmtd's CFG_APPLY_REQ) is delivered on this same event loop,
+ * so blocking here would prevent the loop from ever seeing it.
+ */
+#define VTY_CONFIG_COMMIT_RETRY_MAX 5
+#define VTY_CONFIG_COMMIT_RETRY_INTERVAL_MSEC 50
+
+struct vty_config_commit_ctx {
+	struct vty *vty;
+	int retries_left;
+};
+
+static void vty_config_commit_retry(struct event *t);
+
+static void vty_config_commit_attempt(struct vty_config_commit_ctx *ctx)
+{
+	struct nb_context context = {};
+	char errmsg[BUFSIZ] = {0};
+	int ret;
+
+	/*
+	 * The party we collided with last time may have gone on to commit
+	 * this same config itself while we were waiting to retry, leaving
+	 * our candidate's diff stale against the current running_config.
+	 * Rebase first so a retry after a since-successful competing apply
+	 * is a no-op instead of replaying already-applied creates as
+	 * destroy+recreate. See frr_config_commit_attempt() in libfrr.c.
+	 */
+	if (nb_candidate_needs_update(ctx->vty->candidate_config))
+		nb_candidate_update(ctx->vty->candidate_config);
+
+	context.client = NB_CLIENT_CLI;
+	context.user = ctx->vty;
+	ret = nb_candidate_commit(context, ctx->vty->candidate_config, true,
+				  "Read configuration file", NULL, errmsg,
+				  sizeof(errmsg));
+
+	if (ret == NB_ERR_TRANSACTION_IN_PROGRESS && ctx->retries_left > 0) {
+		ctx->retries_left--;
+		event_add_timer_msec(vty_master, vty_config_commit_retry, ctx,
+				     VTY_CONFIG_COMMIT_RETRY_INTERVAL_MSEC,
+				     NULL);
+		return;
+	}
+
+	if (ret != NB_OK && ret != NB_ERR_NO_CHANGES)
+		zlog_err("%s: failed to read configuration file: %s (%s)",
+			 __func__, nb_err_name(ret), errmsg);
+
+	vty_close(ctx->vty);
+	XFREE(MTYPE_TMP, ctx);
+}
+
+static void vty_config_commit_retry(struct event *t)
+{
+	vty_config_commit_attempt(EVENT_ARG(t));
+}
+
 void vty_read_file_finish(struct vty *vty, struct nb_config *config)
 {
 	struct vty_error *ve;
@@ -2608,22 +2680,18 @@ void vty_read_file_finish(struct vty *vty, struct nb_config *config)
 
 	/*
 	 * Automatically commit the candidate configuration after
-	 * reading the configuration file.
+	 * reading the configuration file. vty_config_commit_attempt() closes
+	 * vty itself once the (possibly retried) commit finishes, so don't
+	 * fall through to vty_close() below in that case.
 	 */
 	if (config == NULL) {
-		struct nb_context context = {};
-		char errmsg[BUFSIZ] = {0};
-		int ret;
+		struct vty_config_commit_ctx *ctx =
+			XMALLOC(MTYPE_TMP, sizeof(*ctx));
 
-		context.client = NB_CLIENT_CLI;
-		context.user = vty;
-		ret = nb_candidate_commit(context, vty->candidate_config, true,
-					  "Read configuration file", NULL,
-					  errmsg, sizeof(errmsg));
-		if (ret != NB_OK && ret != NB_ERR_NO_CHANGES)
-			zlog_err(
-				"%s: failed to read configuration file: %s (%s)",
-				__func__, nb_err_name(ret), errmsg);
+		ctx->vty = vty;
+		ctx->retries_left = VTY_CONFIG_COMMIT_RETRY_MAX;
+		vty_config_commit_attempt(ctx);
+		return;
 	}
 
 	vty_close(vty);
@@ -2914,9 +2982,6 @@ int vty_config_node_exit(struct vty *vty)
 
 	return 1;
 }
-
-/* Master of the threads. */
-static struct event_loop *vty_master;
 
 static void vty_event_serv(enum vty_event event, struct vty_serv *vty_serv)
 {
