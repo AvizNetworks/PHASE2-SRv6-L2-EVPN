@@ -285,11 +285,18 @@ static int nb_cli_apply_changes_internal(struct vty *vty,
 					 false, buf, sizeof(buf), &error);
 	if (error) {
 		/*
-		 * Failure to edit the candidate configuration should never
-		 * happen in practice, unless there's a bug in the code. When
-		 * that happens, log the error but otherwise ignore it.
+		 * The edit was rejected (e.g. a YANG type/length/range
+		 * constraint on the value) - the candidate was never
+		 * changed, so there is nothing to commit. Falling through to
+		 * commit anyway used to look like a legitimate "no changes"
+		 * commit (NB_ERR_NO_CHANGES -> CMD_SUCCESS), which made the
+		 * caller believe the edit succeeded - e.g. `router isis
+		 * <invalid-tag>` printed this error yet still pushed the vty
+		 * into (config-router) for an instance that was never
+		 * created. Return the failure to the caller instead.
 		 */
 		vty_out(vty, "%s", buf);
+		return CMD_WARNING_CONFIG_FAILED;
 	}
 
 	/*
