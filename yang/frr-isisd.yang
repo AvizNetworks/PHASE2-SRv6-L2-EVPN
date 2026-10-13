@@ -568,7 +568,9 @@ module frr-isisd {
     description
       "Interface configuration grouping";
     leaf area-tag {
-      type string;
+      type string {
+        length "1..255";
+      }
       mandatory true;
       description
         "Area-tag associated to this circuit.";
@@ -1168,7 +1170,9 @@ module frr-isisd {
       description
         "IS-IS routing instance.";
       leaf area-tag {
-        type string;
+        type string {
+          length "1..255";
+        }
         description
           "Area-tag associated to this routing instance.";
       }
