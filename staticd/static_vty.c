@@ -1447,6 +1447,9 @@ DEFUN_YANG (no_static_srv6, no_static_srv6_cmd,
 	snprintf(xpath, sizeof(xpath), FRR_STATIC_SRV6_INFO_KEY_XPATH, "frr-staticd:staticd",
 		 "staticd", VRF_DEFAULT_NAME);
 
+	if (!yang_dnode_exists(vty->candidate_config->dnode, xpath))
+		return CMD_SUCCESS;
+
 	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
 
 	return nb_cli_apply_changes(vty, "%s", xpath);
