@@ -1011,6 +1011,68 @@ static void frr_daemonize(void)
  * to read the config in after thread execution starts, so that
  * we can match this behavior.
  */
+/*
+ * NB_ERR_TRANSACTION_IN_PROGRESS at boot means mgmtd is transiently mid-way
+ * through its own two-phase config push to this daemon (see
+ * lib/mgmt_be_client.c) - it clears on its own once mgmtd's CFG_APPLY_REQ
+ * for it arrives. That message is delivered over this same event loop, so
+ * a *blocking* wait here would prevent the loop from ever reading it -
+ * self-defeating. Retry via a deferred event instead, so the loop keeps
+ * servicing I/O (including the message that clears the collision) between
+ * attempts.
+ */
+#define FRR_CONFIG_COMMIT_RETRY_MAX 5
+#define FRR_CONFIG_COMMIT_RETRY_INTERVAL_MSEC 50
+
+static void frr_config_commit_retry(struct event *t);
+
+static void frr_config_commit_attempt(int *retries_left)
+{
+	struct nb_context context = {};
+	char errmsg[BUFSIZ] = {0};
+	int ret;
+
+	/*
+	 * The party we collided with last time (most commonly mgmtd's own
+	 * CFG_APPLY_REQ) may have gone on to commit this same config itself
+	 * while we were waiting to retry. If so, our candidate's diff was
+	 * computed against a running_config that's now stale, and blindly
+	 * recommitting it can turn already-applied creates into spurious
+	 * destroy+recreate pairs (e.g. an interface that's already up gets
+	 * a destroy queued for it, which zebra correctly rejects). Rebase
+	 * the candidate onto the current running_config first so the retry
+	 * only carries whatever is genuinely still outstanding.
+	 */
+	if (nb_candidate_needs_update(vty_shared_candidate_config))
+		nb_candidate_update(vty_shared_candidate_config);
+
+	context.client = NB_CLIENT_CLI;
+	ret = nb_candidate_commit(context, vty_shared_candidate_config, true,
+				  "Read configuration file", NULL, errmsg,
+				  sizeof(errmsg));
+
+	if (ret == NB_ERR_TRANSACTION_IN_PROGRESS && *retries_left > 0) {
+		(*retries_left)--;
+		event_add_timer_msec(master, frr_config_commit_retry,
+				     retries_left,
+				     FRR_CONFIG_COMMIT_RETRY_INTERVAL_MSEC,
+				     NULL);
+		return;
+	}
+
+	if (ret != NB_OK && ret != NB_ERR_NO_CHANGES)
+		zlog_err("%s: failed to read configuration file: %s (%s)",
+			 __func__, nb_err_name(ret), errmsg);
+
+	XFREE(MTYPE_TMP, retries_left);
+	hook_call(frr_config_post, master);
+}
+
+static void frr_config_commit_retry(struct event *t)
+{
+	frr_config_commit_attempt(EVENT_ARG(t));
+}
+
 static void frr_config_read_in(struct event *t)
 {
 	hook_call(frr_config_pre, master);
@@ -1034,18 +1096,15 @@ static void frr_config_read_in(struct event *t)
 	 * reading the configuration file.
 	 */
 	if (frr_get_cli_mode() == FRR_CLI_TRANSACTIONAL) {
-		struct nb_context context = {};
-		char errmsg[BUFSIZ] = {0};
-		int ret;
+		int *retries_left = XMALLOC(MTYPE_TMP, sizeof(int));
 
-		context.client = NB_CLIENT_CLI;
-		ret = nb_candidate_commit(context, vty_shared_candidate_config,
-					  true, "Read configuration file", NULL,
-					  errmsg, sizeof(errmsg));
-		if (ret != NB_OK && ret != NB_ERR_NO_CHANGES)
-			zlog_err(
-				"%s: failed to read configuration file: %s (%s)",
-				__func__, nb_err_name(ret), errmsg);
+		*retries_left = FRR_CONFIG_COMMIT_RETRY_MAX;
+		/* First attempt runs inline; frr_config_commit_attempt() calls
+		 * hook_call(frr_config_post, ...) itself once it's done
+		 * (immediately on success/non-transient failure, or after
+		 * exhausting retries), so don't call it again below. */
+		frr_config_commit_attempt(retries_left);
+		return;
 	}
 
 	hook_call(frr_config_post, master);

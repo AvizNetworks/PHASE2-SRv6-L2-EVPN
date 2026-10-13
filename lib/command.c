@@ -990,8 +990,7 @@ static int cmd_execute_command_real(vector vline, struct vty *vty,
 			if (frr_get_cli_mode() == FRR_CLI_CLASSIC
 			    && running_config->version
 				       > vty->candidate_config->version)
-				nb_config_replace(vty->candidate_config,
-						  running_config, true);
+				nb_candidate_update(vty->candidate_config);
 
 			/*
 			 * Perform pending commit (if any) before executing
