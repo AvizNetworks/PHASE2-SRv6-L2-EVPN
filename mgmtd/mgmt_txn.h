@@ -66,6 +66,7 @@ static inline int16_t errno_from_nb_error(enum nb_error ret)
 	case NB_ERR_EXISTS:
 		return -EEXIST;
 	case NB_ERR_LOCKED:
+	case NB_ERR_TRANSACTION_IN_PROGRESS:
 		return -EWOULDBLOCK;
 	case NB_ERR_VALIDATION:
 		return -EINVAL;

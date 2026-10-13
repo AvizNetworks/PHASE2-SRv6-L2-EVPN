@@ -292,6 +292,7 @@ static int frr_sr_config_change_cb_prepare(sr_session_ctx_t *session,
 	case NB_ERR_NO_CHANGES:
 		return SR_ERR_OK;
 	case NB_ERR_LOCKED:
+	case NB_ERR_TRANSACTION_IN_PROGRESS:
 		return SR_ERR_LOCKED;
 	case NB_ERR_RESOURCE:
 		return SR_ERR_NO_MEMORY;

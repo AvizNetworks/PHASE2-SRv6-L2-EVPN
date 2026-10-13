@@ -1423,7 +1423,19 @@ int nb_changes_commit_prepare(struct nb_context context, struct nb_config_cbs ch
 			  "%s: failed to create transaction: %s", __func__,
 			  errmsg);
 		nb_config_diff_del_changes(&changes);
-		return NB_ERR_LOCKED;
+		/*
+		 * nb_transaction_new() collapses two different failure causes
+		 * into the same NULL return: the running config genuinely
+		 * locked by another client (nb_running_lock_check()), or
+		 * transaction_in_progress already being held transiently
+		 * (e.g. mgmtd mid-way through its own two-phase push to this
+		 * daemon). Re-check the flag here - still file-scope-visible -
+		 * to tell them apart: nb_transaction_new() only ever returns
+		 * NULL via the transient path while it's already true, and
+		 * never sets it on the lock-check failure path, so seeing it
+		 * true here means the transient case fired.
+		 */
+		return transaction_in_progress ? NB_ERR_TRANSACTION_IN_PROGRESS : NB_ERR_LOCKED;
 	}
 
 	return nb_transaction_process(NB_EV_PREPARE, *transaction, errmsg,
@@ -2762,6 +2774,8 @@ const char *nb_err_name(enum nb_error error)
 		return "internal inconsistency";
 	case NB_YIELD:
 		return "should yield";
+	case NB_ERR_TRANSACTION_IN_PROGRESS:
+		return "another transaction is transiently in progress";
 	}
 
 	assert(!"Reached end of function we should never hit");

@@ -452,6 +452,10 @@ extern void vty_resume_response(struct vty *vty, int ret);
  */
 void vty_defer_scheduling(struct vty *vty, bool defer_p);
 
+/* The event loop used by vty sockets - for callers scheduling a deferred
+ * vty_resume_response() (see vty->mgmt_req_pending_cmd) from outside vty.c. */
+extern struct event_loop *vty_get_master(void);
+
 /* --------------------------------------------------- */
 /* Callbacks for Mgmtd front-end CLI vty modifications */
 /* --------------------------------------------------- */

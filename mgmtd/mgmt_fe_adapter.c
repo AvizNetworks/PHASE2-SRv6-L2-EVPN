@@ -381,6 +381,7 @@ enum mgmt_result nb_error_to_mgmt_result(enum nb_error error)
 	case NB_ERR_EXISTS:
 		return MGMTD_VALUE_EXISTS;
 	case NB_ERR_LOCKED:
+	case NB_ERR_TRANSACTION_IN_PROGRESS:
 		return MGMTD_DS_LOCK_FAILED;
 	case NB_ERR_VALIDATION:
 		return MGMTD_VALIDATION_ERROR;
