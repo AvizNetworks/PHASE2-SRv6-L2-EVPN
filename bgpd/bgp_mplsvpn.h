@@ -95,6 +95,9 @@ extern void ensure_vrf_tovpn_sid_per_vrf(struct bgp *vpn, struct bgp *vrf);
 struct bgpevpn;
 extern void bgp_evpn_srv6_install_local_decap(struct bgp *bgp, struct bgpevpn *vpn);
 extern void bgp_evpn_srv6_uninstall_local_decap(struct bgp *bgp, struct bgpevpn *vpn);
+extern void bgp_evpn_srv6_uninstall_stale_decap(struct bgp *bgp, struct bgpevpn *vpn,
+						const struct in6_addr *new_dt2u, uint32_t new_dt2u_oif,
+						const struct in6_addr *new_dt2m, uint32_t new_dt2m_oif);
 
 extern void transpose_sid(struct in6_addr *sid, uint32_t label, uint8_t offset, uint8_t size,
 			  uint8_t size_max);

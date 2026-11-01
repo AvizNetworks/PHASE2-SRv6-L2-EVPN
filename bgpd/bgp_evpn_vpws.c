@@ -180,11 +180,16 @@ static void vpws_request_sid(struct bgp_evpn_vpws *vpws)
 	 * the HAS_SID_VALUE flag spuriously if given NULL, which would
 	 * flip the mode from DYNAMIC to EXPLICIT and make zebra reject
 	 * the request with "parent block/locator not found for SID ::".
+	 *
+	 * Explicit allocation (`sid explicit X:X::X:X`) passes the configured
+	 * value instead, which makes zebra allocate exactly that SID.
 	 */
 	{
 		struct in6_addr sid_zero = {};
+		struct in6_addr *sid_req = vpws->sid_explicit ? &vpws->sid_explicit_value
+							      : &sid_zero;
 
-		if (bgp_zebra_request_srv6_sid(&ctx, &sid_zero, loc_name, &sid_func)) {
+		if (bgp_zebra_request_srv6_sid(&ctx, sid_req, loc_name, &sid_func)) {
 			vpws->sid_requested = true;
 
 			if (debug)
@@ -925,9 +930,18 @@ static void vpws_config_write_one(struct vty *vty, const struct bgp_evpn_vpws *v
 		}
 	}
 
-	if (vpws->ac_ifname[0])
-		vty_out(vty, "   interface %s%s bridge %s\n", vpws->ac_ifname,
-			vpws->sid_auto ? " sid auto" : "", vpws->bridge_ifname);
+	if (vpws->ac_ifname[0]) {
+		char sid_str[64] = "";
+
+		if (vpws->sid_explicit)
+			snprintfrr(sid_str, sizeof(sid_str), " sid explicit %pI6",
+				   &vpws->sid_explicit_value);
+		else if (vpws->sid_auto)
+			snprintfrr(sid_str, sizeof(sid_str), " sid auto");
+
+		vty_out(vty, "   interface %s%s bridge %s\n", vpws->ac_ifname, sid_str,
+			vpws->bridge_ifname);
+	}
 
 	if (vpws->locator_name[0])
 		vty_out(vty, "   locator %s\n", vpws->locator_name);
@@ -1085,7 +1099,7 @@ void bgp_evpn_vpws_handle_remote_ead_withdraw(struct bgp *bgp, const struct pref
 /* ---------- per-instance AC + SID setters ---------- */
 
 int bgp_evpn_vpws_set_interface(struct bgp_evpn_vpws *vpws, const char *ifname, bool sid_auto,
-				const char *bridge_ifname)
+				const struct in6_addr *sid_explicit, const char *bridge_ifname)
 {
 	struct interface *ifp;
 	int debug = BGP_DEBUG(zebra, ZEBRA);
@@ -1109,7 +1123,13 @@ int bgp_evpn_vpws_set_interface(struct bgp_evpn_vpws *vpws, const char *ifname, 
 
 	strlcpy(vpws->ac_ifname, ifname, sizeof(vpws->ac_ifname));
 	strlcpy(vpws->bridge_ifname, bridge_ifname, sizeof(vpws->bridge_ifname));
-	vpws->sid_auto = sid_auto;
+	/* An explicit SID is also requested from zebra, so it implies sid_auto */
+	vpws->sid_explicit = !!sid_explicit;
+	if (sid_explicit)
+		vpws->sid_explicit_value = *sid_explicit;
+	else
+		memset(&vpws->sid_explicit_value, 0, sizeof(vpws->sid_explicit_value));
+	vpws->sid_auto = sid_auto || vpws->sid_explicit;
 
 	/* Resolve ifindex now if possible. If the interface is not yet
 	 * present, ifindex stays invalid; the interface-up hook from
@@ -1156,6 +1176,8 @@ int bgp_evpn_vpws_clear_interface(struct bgp_evpn_vpws *vpws)
 	vpws->ac_ifindex = 0;
 	vpws->ac_ifindex_valid = false;
 	vpws->sid_auto = false;
+	vpws->sid_explicit = false;
+	memset(&vpws->sid_explicit_value, 0, sizeof(vpws->sid_explicit_value));
 
 	return 0;
 }

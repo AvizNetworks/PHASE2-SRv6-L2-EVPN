@@ -180,6 +180,75 @@ struct zebra_srv6_sid_ctx *zebra_srv6_sid_ctx_lookup(const struct srv6_sid_ctx *
 	return NULL;
 }
 
+/*
+ * True if the SID value is already held by an SRv6 SID in the SID manager
+ * (any daemon, any behavior).  The DT2U/DT2M SID of EVI @evi_vni (as selected
+ * by @behavior) is ignored, so re-applying or replacing that EVI's own SID is
+ * not a conflict.
+ */
+bool zebra_srv6_sid_value_in_use(const struct in6_addr *sid, uint32_t evi_vni,
+				 enum seg6local_action_t behavior)
+{
+	struct zebra_srv6 *srv6 = zebra_srv6_get_default();
+	struct zebra_srv6_sid_block *block;
+	struct zebra_srv6_sid_ctx *zctx;
+	struct zebra_srv6_sid_entry *entry;
+	struct listnode *node;
+
+	for (ALL_LIST_ELEMENTS_RO(srv6->sid_blocks, node, block)) {
+		frr_each (zebra_srv6_sid_ctx_list, &block->sids, zctx) {
+			if (!zctx->sid)
+				continue;
+			if (evi_vni && zctx->ctx.dt2_bd == evi_vni && zctx->ctx.behavior == behavior)
+				continue;
+			frr_each (zebra_srv6_sid_entry_list, &zctx->sid->entries, entry)
+				if (IPV6_ADDR_SAME(&entry->sid_value, sid))
+					return true;
+		}
+	}
+
+	return false;
+}
+
+/* True if the function is held explicitly (explicit and dynamic ranges overlap without a SID format) */
+static bool srv6_func_explicit_taken(struct zebra_srv6_sid_block *block, uint32_t func)
+{
+	struct listnode *node;
+	uint32_t *p;
+
+	for (ALL_LIST_ELEMENTS_RO(block->u.uncompressed.func_allocated, node, p))
+		if (*p == func)
+			return true;
+
+	return false;
+}
+
+/*
+ * Pick the next dynamic function, skipping any that an explicit SID holds: a
+ * released one is reused first, otherwise a fresh one is taken from *next_free.
+ */
+static uint32_t srv6_pick_dynamic_func(struct zebra_srv6_sid_block *block, struct list *released,
+				       uint32_t *next_free)
+{
+	struct listnode *node;
+	uint32_t *p;
+	uint32_t func;
+
+	for (ALL_LIST_ELEMENTS_RO(released, node, p)) {
+		if (srv6_func_explicit_taken(block, *p))
+			continue;
+		func = *p;
+		listnode_delete(released, p);
+		zebra_srv6_sid_func_free(p);
+		return func;
+	}
+
+	while (srv6_func_explicit_taken(block, *next_free))
+		(*next_free)++;
+
+	return (*next_free)++;
+}
+
 /* --- Zebra SRv6 SID format management functions --------------------------- */
 
 void srv6_sid_format_register(struct srv6_sid_format *format)
@@ -956,6 +1025,97 @@ static bool zebra_srv6_locator_is_alloc_ready(const struct srv6_locator *locator
 {
 	return locator && SRV6_LOCATOR_PREFIX_IS_SET(locator) &&
 	       locator->sid_block;
+}
+
+/**
+ * Check that a locator can use the given prefix / block length / SID format
+ * without colliding with the other locators and SID blocks.
+ *
+ * The SRv6 SRGB (RFC 8402 section 2) is the set of global SIDs of the domain.
+ * In FRR it is the union of the SID blocks and the locators carved out of
+ * them, so two things must hold for it to stay consistent:
+ *  - locators must not overlap, otherwise the same global SID value could be
+ *    composed from two different locators;
+ *  - all locators sharing (or overlapping) a SID block must agree on the
+ *    block boundaries and on the SID format, because the function ranges
+ *    (LIB/ELIB/WLIB/explicit) are tracked per block.
+ *
+ * @param locator Locator being (re)configured; skipped in the comparison
+ * @param prefix Locator prefix to be used
+ * @param block_len Length in bits of the block part of the locator prefix
+ * @param format SID format to be used, NULL for none
+ * @param err Buffer filled with the reason when a conflict is found
+ * @param err_size Size of the error buffer
+ * @return True if there is a conflict, False otherwise
+ */
+bool zebra_srv6_locator_check_conflict(const struct srv6_locator *locator,
+				       const struct prefix_ipv6 *prefix, uint8_t block_len,
+				       const struct srv6_sid_format *format, char *err,
+				       size_t err_size)
+{
+	struct zebra_srv6 *srv6 = zebra_srv6_get_default();
+	struct srv6_locator *other;
+	struct prefix_ipv6 block_pfx;
+	struct listnode *node;
+
+	if (!srv6 || !prefix || prefix->prefixlen == 0)
+		return false;
+
+	block_pfx = *prefix;
+	block_pfx.prefixlen = block_len;
+	apply_mask(&block_pfx);
+
+	for (ALL_LIST_ELEMENTS_RO(srv6->locators, node, other)) {
+		struct prefix_ipv6 other_block;
+		uint8_t other_block_len;
+		const struct srv6_sid_format *other_format;
+
+		if (other == locator || other->prefix.prefixlen == 0)
+			continue;
+
+		/* Locators must not overlap */
+		if (prefix_match((const struct prefix *)&other->prefix, (const struct prefix *)prefix) ||
+		    prefix_match((const struct prefix *)prefix, (const struct prefix *)&other->prefix)) {
+			snprintfrr(err, err_size, "prefix %pFX overlaps with locator %s (%pFX)", prefix,
+				   other->name, &other->prefix);
+			return true;
+		}
+
+		other_format = other->sid_format;
+		other_block_len = other_format ? other_format->block_len : other->block_bits_length;
+		/* Skip locators/new settings whose block length is not known yet */
+		if (other_block_len == 0 || block_len == 0)
+			continue;
+		other_block = other->prefix;
+		other_block.prefixlen = other_block_len;
+		apply_mask(&other_block);
+
+		/* Locators sharing a block must agree on the block boundaries ... */
+		if ((prefix_match((const struct prefix *)&other_block,
+				  (const struct prefix *)&block_pfx) ||
+		     prefix_match((const struct prefix *)&block_pfx,
+				  (const struct prefix *)&other_block)) &&
+		    !prefix_same((const struct prefix *)&other_block,
+				 (const struct prefix *)&block_pfx)) {
+			snprintfrr(err, err_size,
+				   "SID block %pFX overlaps with the different SID block %pFX of locator %s",
+				   &block_pfx, &other_block, other->name);
+			return true;
+		}
+
+		/* ... and on the SID format used to carve functions out of it */
+		if (prefix_same((const struct prefix *)&other_block,
+				(const struct prefix *)&block_pfx) &&
+		    other_format != format) {
+			snprintfrr(err, err_size,
+				   "locator %s already uses SID block %pFX with SID format '%s'",
+				   other->name, &block_pfx,
+				   other_format ? other_format->name : "none");
+			return true;
+		}
+	}
+
+	return false;
 }
 
 void zebra_srv6_locator_add(struct srv6_locator *locator)
@@ -1917,17 +2077,8 @@ static bool alloc_srv6_sid_func_dynamic(struct zebra_srv6_sid_block *block,
 		 * SID, regardless of which one zebra happens to process
 		 * first at boot.
 		 */
-		if (listcount(block->u.uncompressed.vrf_func_released) != 0) {
-			sid_func_ptr = listnode_head(
-				block->u.uncompressed.vrf_func_released);
-			*sid_func = *sid_func_ptr;
-			listnode_delete(block->u.uncompressed.vrf_func_released,
-					sid_func_ptr);
-			zebra_srv6_sid_func_free(sid_func_ptr);
-		} else {
-			*sid_func = block->u.uncompressed.first_available_vrf_func;
-			block->u.uncompressed.first_available_vrf_func++;
-		}
+		*sid_func = srv6_pick_dynamic_func(block, block->u.uncompressed.vrf_func_released,
+						   &block->u.uncompressed.first_available_vrf_func);
 
 		if (*sid_func >= SRV6_SID_NOFORMAT_EVI_FUNC_BASE) {
 			zlog_warn("%s: VRF-level SRv6 SID reserved range depleted (block %pFX)",
@@ -1941,25 +2092,8 @@ static bool alloc_srv6_sid_func_dynamic(struct zebra_srv6_sid_block *block,
 		 * First, let's check if there are any SID functions that were previously
 		 * allocated and then released.
 		 */
-		if (listcount(block->u.uncompressed.func_released) != 0) {
-			/*
-			 * There are SID functions previously allocated and then released,
-			 * let's pick the first one and reuse it now.
-			 */
-			sid_func_ptr = listnode_head(
-				block->u.uncompressed.func_released);
-			*sid_func = *sid_func_ptr;
-			listnode_delete(block->u.uncompressed.func_released,
-					sid_func_ptr);
-			zebra_srv6_sid_func_free(sid_func_ptr);
-		} else {
-			/*
-			 * There are no SID functions previously allocated and then released,
-			 * let's allocate a new function from the pool of available functions.
-			 */
-			*sid_func = block->u.uncompressed.first_available_func;
-			block->u.uncompressed.first_available_func++;
-		}
+		*sid_func = srv6_pick_dynamic_func(block, block->u.uncompressed.func_released,
+						   &block->u.uncompressed.first_available_func);
 
 		/* Increase the counter of SID functions allocated */
 		block->u.uncompressed.num_func_allocated++;
@@ -2032,6 +2166,15 @@ static int get_srv6_sid_explicit(struct zebra_srv6_sid **sid, struct srv6_sid_ct
 			return 0;
 		}
 
+		/* The SID value must not already belong to another SID */
+		if (ctx->behavior != ZEBRA_SEG6_LOCAL_ACTION_END &&
+		    zebra_srv6_sid_value_in_use(sid_value, ctx->dt2_bd, ctx->behavior)) {
+			flog_err(EC_ZEBRA_SRV6_INVALID_REQUEST,
+				 "%s: invalid SM request arguments: SID %pI6 is already in use",
+				 __func__, sid_value);
+			return -1;
+		}
+
 		/* Allocate an explicit SID function for the SID */
 		if (ctx->behavior != ZEBRA_SEG6_LOCAL_ACTION_END)
 			if (!alloc_srv6_sid_func_explicit(block, sid_func, sid_func_wide)) {
@@ -2063,6 +2206,15 @@ static int get_srv6_sid_explicit(struct zebra_srv6_sid **sid, struct srv6_sid_ct
 		*sid = zctx->sid;
 		(*sid)->ctx = zctx;
 	} else {
+		/* The SID value must not already belong to another SID */
+		if (ctx->behavior != ZEBRA_SEG6_LOCAL_ACTION_END &&
+		    zebra_srv6_sid_value_in_use(sid_value, ctx->dt2_bd, ctx->behavior)) {
+			flog_err(EC_ZEBRA_SRV6_INVALID_REQUEST,
+				 "%s: invalid SM request arguments: SID %pI6 is already in use",
+				 __func__, sid_value);
+			return -1;
+		}
+
 		/* Allocate an explicit SID function for the SID */
 		if (ctx->behavior != ZEBRA_SEG6_LOCAL_ACTION_END)
 			if (!alloc_srv6_sid_func_explicit(block, sid_func, sid_func_wide)) {

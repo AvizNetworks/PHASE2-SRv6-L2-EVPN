@@ -77,6 +77,10 @@ int zebra_srv6_l2evpn_evi_vrf_name_modify(struct nb_cb_modify_args *args);
 int zebra_srv6_l2evpn_evi_vrf_name_destroy(struct nb_cb_destroy_args *args);
 int zebra_srv6_l2evpn_evi_encap_mode_modify(struct nb_cb_modify_args *args);
 int zebra_srv6_l2evpn_evi_encap_mode_destroy(struct nb_cb_destroy_args *args);
+int zebra_srv6_l2evpn_evi_dt2u_sid_modify(struct nb_cb_modify_args *args);
+int zebra_srv6_l2evpn_evi_dt2u_sid_destroy(struct nb_cb_destroy_args *args);
+int zebra_srv6_l2evpn_evi_dt2m_sid_modify(struct nb_cb_modify_args *args);
+int zebra_srv6_l2evpn_evi_dt2m_sid_destroy(struct nb_cb_destroy_args *args);
 #if HAVE_BFDD == 0
 int zebra_ptm_enable_modify(struct nb_cb_modify_args *args);
 #endif

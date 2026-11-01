@@ -1194,6 +1194,47 @@ void bgp_evpn_srv6_uninstall_local_decap(struct bgp *bgp, struct bgpevpn *vpn)
 	vpn->srv6_dt2m_oif = 0;
 }
 
+/*
+ * zebra reported a new set of SIDs/oifs for an EVI that already has decap
+ * routes installed (explicit <-> dynamic SID change, locator reassignment,
+ * ...).  Remove the routes of any previously installed SID that is no longer
+ * current so they do not linger in the kernel.  Unlike
+ * bgp_evpn_srv6_uninstall_local_decap() this leaves the cached state alone:
+ * the caller overwrites it right after and installs the new routes.  Routes
+ * are only ever installed with a non-zero oif, so none is removed without one.
+ */
+void bgp_evpn_srv6_uninstall_stale_decap(struct bgp *bgp, struct bgpevpn *vpn,
+					 const struct in6_addr *new_dt2u, uint32_t new_dt2u_oif,
+					 const struct in6_addr *new_dt2m, uint32_t new_dt2m_oif)
+{
+	struct seg6local_context ctx = {};
+
+	if (!bgp || !vpn)
+		return;
+
+	ctx.dt2_bd = vpn->vni;
+
+	if (vpn->srv6_dt2u_sid_valid && vpn->srv6_dt2u_oif &&
+	    (!IPV6_ADDR_SAME(&vpn->srv6_dt2u_sid, new_dt2u) || vpn->srv6_dt2u_oif != new_dt2u_oif)) {
+		ctx.ifindex = vpn->srv6_dt2u_oif;
+		zlog_info("SRv6 EVI %u: removing stale End.DT2U SID %pI6 l2dev %u", vpn->vni,
+			  &vpn->srv6_dt2u_sid, vpn->srv6_dt2u_oif);
+		zclient_send_localsid(bgp_zclient, ZEBRA_ROUTE_DELETE, &vpn->srv6_dt2u_sid,
+				      IPV6_MAX_BITLEN, vpn->srv6_dt2u_oif,
+				      ZEBRA_SEG6_LOCAL_ACTION_END_DT2U, &ctx);
+	}
+
+	if (vpn->srv6_dt2m_sid_valid && vpn->srv6_dt2m_oif &&
+	    (!IPV6_ADDR_SAME(&vpn->srv6_dt2m_sid, new_dt2m) || vpn->srv6_dt2m_oif != new_dt2m_oif)) {
+		ctx.ifindex = vpn->srv6_dt2m_oif;
+		zlog_info("SRv6 EVI %u: removing stale BUM SID %pI6 (End.DT2U) l2dev %u", vpn->vni,
+			  &vpn->srv6_dt2m_sid, vpn->srv6_dt2m_oif);
+		zclient_send_localsid(bgp_zclient, ZEBRA_ROUTE_DELETE, &vpn->srv6_dt2m_sid,
+				      IPV6_MAX_BITLEN, vpn->srv6_dt2m_oif,
+				      ZEBRA_SEG6_LOCAL_ACTION_END_DT2U, &ctx);
+	}
+}
+
 void delete_vrf_tovpn_sid_per_vrf(struct bgp *bgp_vpn, struct bgp *bgp_vrf)
 {
 	int debug = BGP_DEBUG(vpn, VPN_LEAK_FROM_VRF);

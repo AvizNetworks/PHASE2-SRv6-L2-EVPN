@@ -353,6 +353,13 @@ def test_ping_evi10():
 def test_ping_evi20():
     check_ping("host1c", "198.51.100.2", True, 20, 1)
 
+# (5a) VPWS pseudowire baseline: host1b <-> host2b share 203.0.113.0/24 over the
+#      End.DX2 cross-connect (sid auto).
+@sr6_required
+@sr6_reprogram_required
+def test_ping_vpws():
+    check_ping("host1b", "203.0.113.2", True, 30, 1)
+
 # (5b) DT2U unicast decap, asserted RIGHT AFTER the pings. The unicast per-EVI
 #      DT2U decap SID appears in the kernel with a per-MAC sr6 netdev (sr6-*,
 #      distinct from the bum-sr6 BUM netdev).
@@ -419,6 +426,208 @@ def test_remote_mac_type2_originated():
     assert res is None, ("remote MAC not learned via Type-2 (possible "
                          "zebra_evpn_map_vlan vlan-aware short-circuit):\n%s"
                          % res)
+
+# ---------------------------------------------------------------------------
+# Explicit / automatic SID assignment (EVI DT2U/DT2M + VPWS DX2) and SRv6
+# locator / block validation.  The locator MAIN uses the usid-f3216 format, so
+# explicit functions must come from the ELIB range 0xfe00-0xfeff while dynamic
+# ones come from the LIB (0xe000+); the ranges never overlap.
+# ---------------------------------------------------------------------------
+R1_DT2U = "fcbb:bbbb:1:fe10::"
+R1_DT2M = "fcbb:bbbb:1:fe11::"
+R1_DX2 = "fcbb:bbbb:1:fe20::"
+R1_L = "fcbb:bbbb:1:"
+
+def _evi_cfg(router, evi, cmds):
+    """Run `cmds` (newline separated) inside 'evi <evi>' of the l2-evpn node."""
+    return get_topogen().gears[router].vtysh_cmd(
+        "configure terminal\nsegment-routing\n srv6\n  l2-evpn\n"
+        "   evi %d\n%s\n" % (evi, cmds))
+
+def _vpws_cfg(router, asn, cmds):
+    return get_topogen().gears[router].vtysh_cmd(
+        "configure terminal\nrouter bgp %d\n address-family l2vpn evpn\n"
+        "  vpws-instance V2\n%s\n" % (asn, cmds))
+
+def _running(router, section=None):
+    cmd = "show running-config"
+    return get_topogen().gears[router].vtysh_cmd(cmd)
+
+def _sid_table(router):
+    return get_topogen().gears[router].vtysh_cmd("show segment-routing srv6 sid")
+
+def _expect_in(fn, needle, present=True, count=30, wait=1):
+    """Poll until `needle` is (not) a substring of fn()."""
+    def _c():
+        out = fn()
+        return None if ((needle in out) == present) else out
+    _, res = topotest.run_and_expect(_c, None, count=count, wait=wait)
+    assert res is None, "%s %s expected %s:\n%s" % (
+        needle, "missing" if present else "still present", present, res)
+
+def _block_explicit_used(router):
+    blocks = json.loads(get_topogen().gears[router].vtysh_cmd(
+        "show segment-routing srv6 block json"))["blocks"]
+    for b in blocks:
+        if b["prefix"].startswith("fcbb:bbbb:"):
+            return b["explicitRange"]["allocated"]
+    return None
+
+# (7) EVI explicit DT2U/DT2M SID: accepted, allocated as explicit, advertised
+#     to bgpd, reflected in the block usage counters, and removed again (no
+#     stale local decap route) when switched back to auto.
+def test_evi_explicit_sid_assignment():
+    r1 = get_topogen().gears["r1"]
+    base = _block_explicit_used("r1")
+
+    _evi_cfg("r1", 10, "sid dt2u explicit %s\nsid dt2m explicit %s" % (R1_DT2U, R1_DT2M))
+    run = _running("r1")
+    assert "sid dt2u explicit %s" % R1_DT2U in run, run
+    assert "sid dt2m explicit %s" % R1_DT2M in run, run
+
+    _expect_in(lambda: _sid_table("r1"), R1_DT2U)
+    _expect_in(lambda: _sid_table("r1"), R1_DT2M)
+    _expect_in(lambda: r1.vtysh_cmd("show bgp segment-routing srv6 evpn"), R1_DT2U)
+    _, res = topotest.run_and_expect(
+        lambda: None if _block_explicit_used("r1") == base + 2 else _block_explicit_used("r1"),
+        None, count=15, wait=1)
+    assert res is None, "explicit block usage did not grow by 2 (base %s, now %s)" % (base, res)
+
+    # back to automatic: explicit SIDs released and local decap routes gone
+    _evi_cfg("r1", 10, "sid dt2u auto\nsid dt2m auto")
+    _expect_in(lambda: _sid_table("r1"), R1_DT2U, present=False)
+    _expect_in(lambda: _sid_table("r1"), R1_DT2M, present=False)
+    _expect_in(lambda: r1.run("ip -6 route show"), R1_DT2U, present=False)
+    _expect_in(lambda: r1.run("ip -6 route show"), R1_DT2M, present=False)
+    assert _block_explicit_used("r1") == base
+    assert "sid dt2u explicit" not in _running("r1")
+
+# (7b) the EVI still forwards with an explicit SID (remote PE re-learns it)
+@sr6_required
+@sr6_reprogram_required
+def test_ping_evi10_explicit_sid():
+    _evi_cfg("r1", 10, "sid dt2u explicit %s\nsid dt2m explicit %s" % (R1_DT2U, R1_DT2M))
+    try:
+        _expect_in(lambda: get_topogen().gears["r1"].run("ip -6 route show"), R1_DT2U)
+        check_ping("host1", "192.0.2.2", True, 30, 1)
+    finally:
+        _evi_cfg("r1", 10, "sid dt2u auto\nsid dt2m auto")
+    check_ping("host1", "192.0.2.2", True, 30, 1)
+
+# (8) EVI explicit SID validation: rejected at the CLI, config stays unchanged.
+def test_evi_explicit_sid_validation():
+    # outside the EVI's locator (MAIN = fcbb:bbbb:1::/48)
+    out = _evi_cfg("r1", 10, "sid dt2u explicit fcbb:bbbb:2:fe10::")
+    assert "sid dt2u explicit fcbb:bbbb:2:fe10::" not in _running("r1"), out
+    # outside the block entirely
+    out = _evi_cfg("r1", 10, "sid dt2u explicit 2001:db8:ffff:fe10::")
+    assert "sid dt2u explicit 2001:db8:ffff:fe10::" not in _running("r1"), out
+
+    # same value for DT2U and DT2M of one EVI
+    _evi_cfg("r1", 10, "sid dt2u explicit %s" % R1_DT2U)
+    try:
+        out = _evi_cfg("r1", 10, "sid dt2m explicit %s" % R1_DT2U)
+        assert "sid dt2m explicit" not in _running("r1"), out
+        # same value on another EVI
+        out = _evi_cfg("r1", 20, "sid dt2u explicit %s" % R1_DT2U)
+        assert _running("r1").count("sid dt2u explicit %s" % R1_DT2U) == 1, out
+    finally:
+        _evi_cfg("r1", 10, "sid dt2u auto")
+    assert "sid dt2u explicit" not in _running("r1")
+
+# (9) existing dynamic SID: an explicit value equal to a live SID is refused
+#     (the manager must not hold two SIDs on one address).
+def test_evi_explicit_sid_conflicts_with_live_sid():
+    r1 = get_topogen().gears["r1"]
+    live = [ln.split()[0] for ln in _sid_table("r1").splitlines()
+            if ln.split() and ln.split()[0].startswith(R1_L) and
+            "DT2U" in ln]
+    assert live, "no live End.DT2U SID to collide with:\n%s" % _sid_table("r1")
+    sid = live[0]
+    out = _evi_cfg("r1", 20, "sid dt2m explicit %s" % sid)
+    assert "sid dt2m explicit" not in _running("r1"), out
+
+
+# (10) VPWS explicit End.DX2 SID: allocated as explicit, installed in the
+#      kernel, and advertised; switching back to auto removes the explicit
+#      route and re-installs a dynamic one.
+def test_vpws_explicit_sid():
+    r1 = get_topogen().gears["r1"]
+    base = _block_explicit_used("r1")
+
+    _vpws_cfg("r1", 65001, "  interface eth2 sid explicit %s bridge br-vpws" % R1_DX2)
+    assert ("interface eth2 sid explicit %s bridge br-vpws" % R1_DX2) in _running("r1")
+
+    _expect_in(lambda: _sid_table("r1"), R1_DX2)
+    _expect_in(lambda: r1.vtysh_cmd("show bgp segment-routing srv6 evpn"), R1_DX2)
+    _expect_in(lambda: "\n".join(l for l in r1.run("ip -6 route show").splitlines()
+                                 if R1_DX2 in l and "End.DX2" in l and "oif eth2" in l),
+               R1_DX2)
+    assert _block_explicit_used("r1") == base + 1
+
+    _vpws_cfg("r1", 65001, "  interface eth2 sid auto bridge br-vpws")
+    _expect_in(lambda: _sid_table("r1"), R1_DX2, present=False)
+    _expect_in(lambda: r1.run("ip -6 route show"), R1_DX2, present=False)
+    _expect_in(lambda: "\n".join(l for l in r1.run("ip -6 route show").splitlines()
+                                 if "End.DX2" in l and "oif eth2" in l),
+               "End.DX2")
+    assert _block_explicit_used("r1") == base
+
+@sr6_required
+@sr6_reprogram_required
+def test_ping_vpws_explicit_sid():
+    # host1b/host2b share 203.0.113.0/24 over the pseudowire
+    check_ping("host1b", "203.0.113.2", True, 30, 1)
+    _vpws_cfg("r1", 65001, "  interface eth2 sid explicit %s bridge br-vpws" % R1_DX2)
+    try:
+        _expect_in(lambda: get_topogen().gears["r1"].run("ip -6 route show"), R1_DX2)
+        check_ping("host1b", "203.0.113.2", True, 30, 1)
+    finally:
+        _vpws_cfg("r1", 65001, "  interface eth2 sid auto bridge br-vpws")
+    check_ping("host1b", "203.0.113.2", True, 30, 1)
+
+# (11) a VPWS explicit SID must not collide with an EVI SID, in either order
+def test_vpws_evi_explicit_sid_cross_check():
+    _evi_cfg("r1", 10, "sid dt2u explicit %s" % R1_DT2U)
+    try:
+        _vpws_cfg("r1", 65001, "  interface eth2 sid explicit %s bridge br-vpws" % R1_DT2U)
+        # the SID table must hold R1_DT2U exactly once
+        assert _sid_table("r1").count(R1_DT2U) == 1, _sid_table("r1")
+    finally:
+        _vpws_cfg("r1", 65001, "  interface eth2 sid auto bridge br-vpws")
+        _evi_cfg("r1", 10, "sid dt2u auto")
+    assert R1_DT2U not in _sid_table("r1")
+
+# (12) locator / block validation: a locator whose prefix overlaps an existing
+#      locator is rejected, MAIN stays untouched.
+def test_locator_overlap_rejected():
+    r1 = get_topogen().gears["r1"]
+    before = _running("r1").count("prefix fcbb:bbbb:1::/48")
+    assert before == 1
+    # (prefix, node-len): block-len 32 + node-len must equal the prefix length
+    for dup, nlen in (("fcbb:bbbb:1::/48", 16), ("fcbb:bbbb:1:1::/64", 32)):
+        out = r1.vtysh_cmd(
+            "configure terminal\nsegment-routing\n srv6\n  locators\n"
+            "   locator DUP\n    prefix %s block-len 32 node-len %d\n" % (dup, nlen))
+        assert "overlaps with locator MAIN" in out, out
+        # MAIN is untouched and DUP got no prefix
+        assert _running("r1").count("prefix fcbb:bbbb:1::/48") == 1, out
+        assert "prefix %s" % dup not in _running("r1") or dup == "fcbb:bbbb:1::/48", out
+    r1.vtysh_cmd("configure terminal\nsegment-routing\n srv6\n  locators\n"
+                 "   no locator DUP\n")
+    assert _running("r1").count("prefix fcbb:bbbb:1::/48") == 1
+
+# (13) 'show segment-routing srv6 block' and the SID Scope column
+def test_show_srv6_block_and_sid_scope():
+    _expect_in(lambda: get_topogen().gears["r1"].vtysh_cmd(
+        "show segment-routing srv6 block"), "fcbb:bbbb::/32")
+    blocks = json.loads(get_topogen().gears["r1"].vtysh_cmd(
+        "show segment-routing srv6 block json"))["blocks"]
+    blk = [b for b in blocks if b["prefix"].startswith("fcbb:bbbb:")]
+    assert blk and blk[0]["format"] == "usid-f3216", blocks
+    assert blk[0]["explicitRange"]["start"] == 0xFE00 and blk[0]["explicitRange"]["end"] == 0xFEFF
+    assert "Scope" in _sid_table("r1")
+
 
 # (6) teardown, stays LAST: removing the VLAN->EVI bindings releases the per-EVI
 #     End.DT2U / End.DT2M service SIDs (replaces the old 'no sid vpn export').

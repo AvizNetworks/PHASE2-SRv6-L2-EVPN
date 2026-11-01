@@ -3787,6 +3787,10 @@ static int bgp_zebra_process_local_vni(ZAPI_CALLBACK_ARGS)
 			struct bgpevpn *vpn = bgp_evpn_lookup_vni(bgp, vni);
 
 			if (vpn) {
+				/* Drop decap routes of SIDs this update replaces */
+				bgp_evpn_srv6_uninstall_stale_decap(bgp, vpn, &srv6_dt2u_sid,
+								    srv6_dt2u_oif, &srv6_dt2m_sid,
+								    srv6_dt2m_oif);
 				vpn->srv6_dt2u_sid = srv6_dt2u_sid;
 				vpn->srv6_dt2m_sid = srv6_dt2m_sid;
 				vpn->srv6_dt2u_sid_valid = !IN6_IS_ADDR_UNSPECIFIED(&srv6_dt2u_sid);

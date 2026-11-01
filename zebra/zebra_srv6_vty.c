@@ -418,6 +418,16 @@ static const char *show_srv6_sid_seg6_context(char *str, size_t size, const stru
 	return str;
 }
 
+/*
+ * Scope of a SID in the sense of RFC 8402 section 2: a SID composed with the
+ * node part of the locator is routable, hence global to the SR domain; a
+ * local-only SID (block + function) is only meaningful on the node owning it.
+ */
+static inline const char *srv6_sid_scope2str(bool is_localonly)
+{
+	return is_localonly ? "local" : "global";
+}
+
 static void do_show_srv6_sid_line(struct ttable *tt, struct zebra_srv6_sid *sid,
 				  struct in6_addr *sid_value, struct srv6_locator *locator)
 {
@@ -509,8 +519,9 @@ static void do_show_srv6_sid_line(struct ttable *tt, struct zebra_srv6_sid *sid,
 		snprintf(alloc_mode_str, sizeof(alloc_mode_str), "%s",
 			 srv6_sid_alloc_mode2str(sid->alloc_mode));
 
-		ttable_add_row(tt, "%pI6|%s|%s|%s|%s|%s", &entry->sid_value, behavior, ctx,
-			       clients, locator_name, alloc_mode_str);
+		ttable_add_row(tt, "%pI6|%s|%s|%s|%s|%s|%s", &entry->sid_value, behavior, ctx,
+			       clients, locator_name, alloc_mode_str,
+			       srv6_sid_scope2str(entry->is_localonly));
 	}
 }
 
@@ -583,6 +594,7 @@ static void do_show_srv6_sid_json(struct vty *vty, json_object **json, struct sr
 		json_object_string_add(json_sid, "locator", entry->locator->name);
 		json_object_string_add(json_sid, "allocationMode",
 				       srv6_sid_alloc_mode2str(sid_ctx->sid->alloc_mode));
+		json_object_string_add(json_sid, "scope", srv6_sid_scope2str(entry->is_localonly));
 
 		/* Zclients */
 		json_sid_clients = json_object_new_array();
@@ -619,7 +631,7 @@ static void do_show_srv6_sid_specific(struct vty *vty, json_object **json,
 		/* Prepare table. */
 		tt = ttable_new(&ttable_styles[TTSTYLE_BLANK]);
 
-		ttable_add_row(tt, "SID|Behavior|Context|Daemon/Instance|Locator|AllocationType");
+		ttable_add_row(tt, "SID|Behavior|Context|Daemon/Instance|Locator|AllocationType|Scope");
 		tt->style.cell.rpad = 2;
 		tt->style.corner = ' ';
 		ttable_restyle(tt);
@@ -692,7 +704,7 @@ static void do_show_srv6_sid_all(struct vty *vty, json_object **json, struct srv
 	} else {
 		/* Prepare table. */
 		tt = ttable_new(&ttable_styles[TTSTYLE_BLANK]);
-		ttable_add_row(tt, "SID|Behavior|Context|Daemon/Instance|Locator|AllocationType");
+		ttable_add_row(tt, "SID|Behavior|Context|Daemon/Instance|Locator|AllocationType|Scope");
 		tt->style.cell.rpad = 2;
 		tt->style.corner = ' ';
 		ttable_restyle(tt);
@@ -908,6 +920,209 @@ DEFPY (show_srv6_sid,
 
 	if (uj)
 		vty_json(vty, json);
+
+	return CMD_SUCCESS;
+}
+
+/*
+ * Function ranges and usage of a SID block.  The ranges are those the SID
+ * manager draws from: "dynamic" for automatic assignment and "explicit" for
+ * manually configured SIDs.
+ */
+struct srv6_block_ranges {
+	bool explicit_any; /* no format: explicit SIDs are not range restricted */
+	uint32_t dyn_start, dyn_end;
+	uint32_t exp_start, exp_end;
+	uint32_t dyn_used, exp_used;
+	uint32_t wide_used; /* uSID only: functions allocated in the Wide LIB */
+	const char *dyn_name, *exp_name;
+};
+
+/*
+ * Count the SIDs currently holding a function in the block, by allocation
+ * mode.  The manager's own num_func_allocated counter is not decremented when a
+ * function is released, so it cannot be used for "in use" figures.  End SIDs
+ * (locator address, function 0) do not consume a function and are skipped.
+ */
+static void srv6_block_count_sids(const struct zebra_srv6_sid_block *block,
+				  struct srv6_block_ranges *r)
+{
+	struct zebra_srv6_sid_ctx *zctx;
+
+	frr_each (zebra_srv6_sid_ctx_list, &((struct zebra_srv6_sid_block *)block)->sids, zctx) {
+		if (!zctx->sid || zctx->ctx.behavior == ZEBRA_SEG6_LOCAL_ACTION_END)
+			continue;
+		if (zctx->sid->alloc_mode == SRV6_SID_ALLOC_MODE_EXPLICIT)
+			r->exp_used++;
+		else
+			r->dyn_used++;
+	}
+}
+
+static void srv6_block_get_ranges(const struct zebra_srv6_sid_block *block,
+				  const struct srv6_locator *first_loc, struct srv6_block_ranges *r)
+{
+	const struct srv6_sid_format *format = block->sid_format;
+	uint32_t func_len = format ? format->function_len : (first_loc ? first_loc->function_bits_length : 0);
+	uint32_t func_max = func_len >= 32 ? UINT32_MAX : (1U << func_len) - 1;
+
+	memset(r, 0, sizeof(*r));
+
+	if (format && format->type == SRV6_SID_FORMAT_TYPE_USID) {
+		r->dyn_name = "LIB";
+		r->exp_name = "ELIB";
+		r->dyn_start = format->config.usid.lib_start;
+		r->dyn_end = format->config.usid.elib_start - 1;
+		r->exp_start = format->config.usid.elib_start;
+		r->exp_end = format->config.usid.elib_end;
+
+		srv6_block_count_sids(block, r);
+		if (block->u.usid.wide_lib && format->config.usid.wlib_end >= format->config.usid.wlib_start)
+			for (uint32_t i = 0;
+			     i <= format->config.usid.wlib_end - format->config.usid.wlib_start; i++)
+				r->wide_used += block->u.usid.wide_lib[i].num_func_allocated;
+		return;
+	}
+
+	r->dyn_name = "dynamic";
+	r->exp_name = "explicit";
+	if (format) {
+		r->dyn_start = SRV6_SID_FORMAT_UNCOMPRESSED_F4024_FUNC_UNRESERVED_MIN;
+		r->dyn_end = format->config.uncompressed.explicit_start - 1;
+		r->exp_start = format->config.uncompressed.explicit_start;
+		r->exp_end = func_max;
+	} else {
+		r->explicit_any = true;
+		r->dyn_start = 1;
+		r->dyn_end = func_max;
+	}
+
+	srv6_block_count_sids(block, r);
+}
+
+static void srv6_block_locators_str(const struct zebra_srv6_sid_block *block, char *buf, size_t size)
+{
+	struct zebra_srv6 *srv6 = zebra_srv6_get_default();
+	struct srv6_locator *loc;
+	struct listnode *node;
+
+	buf[0] = '\0';
+	for (ALL_LIST_ELEMENTS_RO(srv6->locators, node, loc)) {
+		if (loc->sid_block != block)
+			continue;
+		if (buf[0])
+			strlcat(buf, ",", size);
+		strlcat(buf, loc->name, size);
+	}
+}
+
+static const struct srv6_locator *srv6_block_first_locator(const struct zebra_srv6_sid_block *block)
+{
+	struct zebra_srv6 *srv6 = zebra_srv6_get_default();
+	struct srv6_locator *loc;
+	struct listnode *node;
+
+	for (ALL_LIST_ELEMENTS_RO(srv6->locators, node, loc))
+		if (loc->sid_block == block)
+			return loc;
+
+	return NULL;
+}
+
+DEFPY (show_srv6_block,
+       show_srv6_block_cmd,
+       "show segment-routing srv6 block [json$uj]",
+       SHOW_STR
+       "Segment Routing\n"
+       "Segment Routing SRv6\n"
+       "SRv6 SID blocks: global SID space, function ranges and usage\n"
+       JSON_STR)
+{
+	struct zebra_srv6 *srv6 = zebra_srv6_get_default();
+	struct zebra_srv6_sid_block *block;
+	struct listnode *node;
+	struct ttable *tt = NULL;
+	json_object *json = NULL, *json_blocks = NULL;
+
+	if (uj) {
+		json = json_object_new_object();
+		json_blocks = json_object_new_array();
+		json_object_object_add(json, "blocks", json_blocks);
+	} else {
+		tt = ttable_new(&ttable_styles[TTSTYLE_BLANK]);
+		ttable_add_row(tt, "Block|Format|Locators|Dynamic range|Used|Explicit range|Used");
+		tt->style.cell.rpad = 2;
+		tt->style.corner = ' ';
+		ttable_restyle(tt);
+		ttable_rowseps(tt, 0, BOTTOM, true, '-');
+	}
+
+	for (ALL_LIST_ELEMENTS_RO(srv6->sid_blocks, node, block)) {
+		struct srv6_block_ranges r;
+		char locs[512];
+		const char *fmt_name = block->sid_format ? block->sid_format->name : "none";
+
+		srv6_block_get_ranges(block, srv6_block_first_locator(block), &r);
+		srv6_block_locators_str(block, locs, sizeof(locs));
+
+		if (uj) {
+			json_object *jb = json_object_new_object();
+			json_object *jl = json_object_new_array();
+			json_object *jr;
+			struct listnode *ln;
+			struct srv6_locator *loc;
+
+			json_object_string_addf(jb, "prefix", "%pFX", &block->prefix);
+			json_object_string_add(jb, "format", fmt_name);
+			json_object_int_add(jb, "referenceCount", block->refcnt);
+			for (ALL_LIST_ELEMENTS_RO(srv6->locators, ln, loc))
+				if (loc->sid_block == block)
+					json_object_array_add(jl, json_object_new_string(loc->name));
+			json_object_object_add(jb, "locators", jl);
+
+			jr = json_object_new_object();
+			json_object_string_add(jr, "name", r.dyn_name);
+			json_object_int_add(jr, "start", r.dyn_start);
+			json_object_int_add(jr, "end", r.dyn_end);
+			json_object_int_add(jr, "allocated", r.dyn_used);
+			json_object_object_add(jb, "dynamicRange", jr);
+
+			jr = json_object_new_object();
+			json_object_string_add(jr, "name", r.exp_name);
+			json_object_boolean_add(jr, "unrestricted", r.explicit_any);
+			if (!r.explicit_any) {
+				json_object_int_add(jr, "start", r.exp_start);
+				json_object_int_add(jr, "end", r.exp_end);
+			}
+			json_object_int_add(jr, "allocated", r.exp_used);
+			json_object_object_add(jb, "explicitRange", jr);
+
+			if (block->sid_format && block->sid_format->type == SRV6_SID_FORMAT_TYPE_USID)
+				json_object_int_add(jb, "wideLibAllocated", r.wide_used);
+			json_object_array_add(json_blocks, jb);
+		} else {
+			char exp_range[48];
+
+			if (r.explicit_any)
+				snprintf(exp_range, sizeof(exp_range), "any");
+			else
+				snprintf(exp_range, sizeof(exp_range), "%s %#x-%#x", r.exp_name,
+					 r.exp_start, r.exp_end);
+			ttable_add_row(tt, "%pFX|%s|%s|%s %#x-%#x|%u|%s|%u", &block->prefix, fmt_name,
+				       locs[0] ? locs : "-", r.dyn_name, r.dyn_start, r.dyn_end,
+				       r.dyn_used, exp_range, r.exp_used);
+		}
+	}
+
+	if (uj) {
+		vty_json(vty, json);
+	} else {
+		char *out = ttable_dump(tt, "\n");
+
+		vty_out(vty, "%s\n", out);
+		XFREE(MTYPE_TMP_TTABLE, out);
+		ttable_del(tt);
+	}
 
 	return CMD_SUCCESS;
 }
@@ -1162,6 +1377,19 @@ DEFPY (locator_prefix,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
+	/* The locator must not overlap other locators or SID blocks */
+	{
+		char conflict[256];
+
+		if (zebra_srv6_locator_check_conflict(locator, prefix,
+						      format ? format->block_len : block_bit_len,
+						      format, conflict, sizeof(conflict))) {
+			vty_out(vty, "%% Cannot configure locator %s: %s\n", locator->name,
+				conflict);
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+	}
+
 	locator->prefix = *prefix;
 	locator->block_bits_length = block_bit_len;
 	locator->node_bits_length = node_bit_len;
@@ -1360,6 +1588,18 @@ DEFPY(locator_sid_format,
 		/* Format has not changed, nothing to do */
 		return CMD_SUCCESS;
 
+	{
+		char conflict[256];
+
+		if (zebra_srv6_locator_check_conflict(locator, &locator->prefix,
+						      sid_format->block_len, sid_format, conflict,
+						      sizeof(conflict))) {
+			vty_out(vty, "%% Cannot set format '%s' on locator %s: %s\n", format,
+				locator->name, conflict);
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+	}
+
 	zebra_srv6_locator_format_set(locator, sid_format);
 
 	return CMD_SUCCESS;
@@ -1377,6 +1617,18 @@ DEFPY (no_locator_sid_format,
 	if (!locator->sid_format)
 		/* SID format already unset, nothing to do */
 		return CMD_SUCCESS;
+
+	{
+		char conflict[256];
+
+		if (zebra_srv6_locator_check_conflict(locator, &locator->prefix,
+						      locator->block_bits_length, NULL, conflict,
+						      sizeof(conflict))) {
+			vty_out(vty, "%% Cannot unset the format of locator %s: %s\n",
+				locator->name, conflict);
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+	}
 
 	zebra_srv6_locator_format_set(locator, NULL);
 
@@ -2171,6 +2423,42 @@ DEFPY_YANG (no_srv6_evi_l2_encap_mode,
 	return nb_cli_apply_changes(vty, NULL);
 }
 
+DEFPY_YANG (srv6_evi_sid,
+       srv6_evi_sid_cmd,
+       "sid <dt2u|dt2m>$kind <auto$sid_auto|explicit$sid_explicit X:X::X:X$sid_value>",
+       "Configure the SRv6 service SID of this EVI\n"
+       "End.DT2U (unicast) SID\n"
+       "End.DT2M (BUM) SID\n"
+       "Allocate the SID automatically from the EVI's locator (default)\n"
+       "Use a manually configured SID value\n"
+       "SRv6 SID value\n")
+{
+	const char *leaf = strmatch(kind, "dt2u") ? "./dt2u-sid" : "./dt2m-sid";
+
+	if (sid_auto)
+		nb_cli_enqueue_change(vty, leaf, NB_OP_DESTROY, NULL);
+	else
+		nb_cli_enqueue_change(vty, leaf, NB_OP_MODIFY, sid_value_str);
+
+	return nb_cli_apply_changes(vty, NULL);
+}
+
+DEFPY_YANG (no_srv6_evi_sid,
+       no_srv6_evi_sid_cmd,
+       "no sid <dt2u|dt2m>$kind [<auto|explicit X:X::X:X>]",
+       NO_STR
+       "Configure the SRv6 service SID of this EVI\n"
+       "End.DT2U (unicast) SID\n"
+       "End.DT2M (BUM) SID\n"
+       "Allocate the SID automatically from the EVI's locator (default)\n"
+       "Use a manually configured SID value\n"
+       "SRv6 SID value\n")
+{
+	nb_cli_enqueue_change(vty, strmatch(kind, "dt2u") ? "./dt2u-sid" : "./dt2m-sid",
+			      NB_OP_DESTROY, NULL);
+	return nb_cli_apply_changes(vty, NULL);
+}
+
 DEFPY_YANG (srv6_evi_vlan,
        srv6_evi_vlan_cmd,
        "vlan (1-4094)$vid",
@@ -2318,6 +2606,8 @@ void zebra_srv6_vty_init(void)
 	install_element(SRV6_L2EVPN_NODE, &srv6_l2evpn_evi_cmd);
 	install_element(SRV6_L2EVPN_NODE, &no_srv6_l2evpn_evi_cmd);
 	install_element(SRV6_L2EVPN_EVI_NODE, &srv6_evi_service_type_cmd);
+	install_element(SRV6_L2EVPN_EVI_NODE, &srv6_evi_sid_cmd);
+	install_element(SRV6_L2EVPN_EVI_NODE, &no_srv6_evi_sid_cmd);
 	install_element(SRV6_L2EVPN_EVI_NODE, &srv6_evi_l2_encap_mode_cmd);
 	install_element(SRV6_L2EVPN_EVI_NODE, &no_srv6_evi_l2_encap_mode_cmd);
 	install_element(SRV6_L2EVPN_EVI_NODE, &srv6_evi_vlan_cmd);
@@ -2381,6 +2671,7 @@ void zebra_srv6_vty_init(void)
 	install_element(VIEW_NODE, &show_srv6_locator_detail_cmd);
 	install_element(VIEW_NODE, &show_srv6_manager_cmd);
 	install_element(VIEW_NODE, &show_srv6_sid_cmd);
+	install_element(VIEW_NODE, &show_srv6_block_cmd);
 
 	install_element(VIEW_NODE, &show_srv6_sid_counters_cmd);
 	install_element(ENABLE_NODE, &clear_srv6_sid_counters_cmd);

@@ -56,7 +56,9 @@ struct bgp_evpn_vpws {
 	bool ac_ifindex_valid;
 
 	/* Per-instance End.DX2 SID, allocated via zebra */
-	bool sid_auto;	    /* `sid auto` was configured */
+	bool sid_auto;	    /* a SID is requested from zebra (`sid auto` or `sid explicit`) */
+	bool sid_explicit;  /* `sid explicit X:X::X:X` was configured */
+	struct in6_addr sid_explicit_value;
 	bool sid_requested; /* request sent, awaiting notify */
 	bool sid_allocated; /* notify received, SID is valid */
 	struct in6_addr local_sid;
@@ -156,7 +158,8 @@ extern void bgp_evpn_vpws_config_write_all(struct vty *vty, struct bgp *bgp);
 
 /* --------- per-instance AC + SID setters (called from VTY) --------- */
 extern int bgp_evpn_vpws_set_interface(struct bgp_evpn_vpws *vpws, const char *ifname,
-				       bool sid_auto, const char *bridge_ifname);
+				       bool sid_auto, const struct in6_addr *sid_explicit,
+				       const char *bridge_ifname);
 extern int bgp_evpn_vpws_clear_interface(struct bgp_evpn_vpws *vpws);
 
 /* Per-instance SRv6 locator binding (NULL/empty name clears it). Re-requests
