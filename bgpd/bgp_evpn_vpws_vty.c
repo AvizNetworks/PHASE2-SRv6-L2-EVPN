@@ -249,21 +249,24 @@ DEFPY (no_bgp_evpn_vpws_rt,
 	return CMD_SUCCESS;
 }
 
-/* ---------- interface IFNAME [sid auto] ---------- */
+/* ---------- interface IFNAME [sid <auto|explicit X:X::X:X>] ---------- */
 
 DEFPY (bgp_evpn_vpws_interface_sid,
        bgp_evpn_vpws_interface_sid_cmd,
-       "interface IFNAME$ifname [sid auto$sid_auto] bridge IFNAME2$brname",
+       "interface IFNAME$ifname [sid <auto$sid_auto|explicit$sid_explicit X:X::X:X$sid_value>] bridge IFNAME2$brname",
        "Bind attachment circuit interface\n"
        "Interface name\n"
        "SRv6 SID allocation\n"
        "Auto allocate from BGP-bound locator\n"
+       "Use a manually configured SID value\n"
+       "SRv6 SID value (must belong to the VPWS or BGP locator)\n"
        "Operator-created bridge dedicated to this VPWS instance\n"
        "Bridge interface name\n")
 {
 	VTY_DECLVAR_CONTEXT_SUB(bgp_evpn_vpws, ctx);
 
-	if (bgp_evpn_vpws_set_interface(ctx, ifname, !!sid_auto, brname) < 0) {
+	if (bgp_evpn_vpws_set_interface(ctx, ifname, !!sid_auto, sid_explicit ? &sid_value : NULL,
+					brname) < 0) {
 		vty_out(vty, "%% Cannot bind interface %s\n", ifname);
 		return CMD_WARNING_CONFIG_FAILED;
 	}

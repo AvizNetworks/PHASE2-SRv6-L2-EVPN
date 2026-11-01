@@ -188,6 +188,20 @@ const struct frr_yang_module_info frr_zebra_info = {
 				.destroy = zebra_srv6_l2evpn_evi_encap_mode_destroy,
 			}
 		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/dt2u-sid",
+			.cbs = {
+				.modify = zebra_srv6_l2evpn_evi_dt2u_sid_modify,
+				.destroy = zebra_srv6_l2evpn_evi_dt2u_sid_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/dt2m-sid",
+			.cbs = {
+				.modify = zebra_srv6_l2evpn_evi_dt2m_sid_modify,
+				.destroy = zebra_srv6_l2evpn_evi_dt2m_sid_destroy,
+			}
+		},
 #if HAVE_BFDD == 0
 		{
 			.xpath = "/frr-zebra:zebra/ptm-enable",

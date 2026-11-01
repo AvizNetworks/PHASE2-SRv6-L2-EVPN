@@ -33,6 +33,7 @@
 #include "zebra/ipforward.h"
 #include "zebra/zebra_nhg.h"
 #include "lib/vrf.h"
+#include "zebra/zebra_srv6.h"
 #include "zebra/zebra_srv6_l2evpn.h"
 #include "zebra/zebra_sr6.h"
 
@@ -369,6 +370,109 @@ int zebra_srv6_l2evpn_evi_encap_mode_destroy(struct nb_cb_destroy_args *args)
 		zebra_srv6_evi_set_encap_mode(evi, ZEBRA_SR6_ENCAP_MODE_FULL);
 
 	return NB_OK;
+}
+
+/*
+ * Common handler of the manually assigned End.DT2U / End.DT2M EVI SIDs.
+ */
+static int zebra_srv6_l2evpn_evi_sid_modify(struct nb_cb_modify_args *args, bool bum)
+{
+	struct zebra_srv6_evi *evi;
+	struct in6_addr sid;
+	struct srv6_locator *loc;
+	struct prefix_ipv6 sid_pfx;
+
+	yang_dnode_get_ipv6(&sid, args->dnode, NULL);
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+		if (IN6_IS_ADDR_UNSPECIFIED(&sid) || IN6_IS_ADDR_MULTICAST(&sid) ||
+		    IN6_IS_ADDR_LINKLOCAL(&sid) || IN6_IS_ADDR_LOOPBACK(&sid)) {
+			snprintfrr(args->errmsg, args->errmsg_len,
+				 "%pI6 is not a valid SRv6 SID", &sid);
+			return NB_ERR_VALIDATION;
+		}
+		/* The SID must lie inside the locator the EVI allocates from */
+		if (yang_dnode_exists(args->dnode, "../locator-name")) {
+			loc = zebra_srv6_locator_lookup(
+				yang_dnode_get_string(args->dnode, "../locator-name"));
+			sid_pfx.family = AF_INET6;
+			sid_pfx.prefixlen = IPV6_MAX_BITLEN;
+			sid_pfx.prefix = sid;
+			if (loc && loc->prefix.prefixlen &&
+			    !prefix_match((struct prefix *)&loc->prefix, (struct prefix *)&sid_pfx)) {
+				snprintfrr(args->errmsg, args->errmsg_len,
+					 "SID %pI6 is outside locator %s (%pFX)", &sid, loc->name,
+					 &loc->prefix);
+				return NB_ERR_VALIDATION;
+			}
+		}
+		if (zebra_srv6_sid_value_in_use(&sid, yang_dnode_get_uint32(args->dnode, "../vni"),
+						bum ? ZEBRA_SEG6_LOCAL_ACTION_END_DT2M
+						    : ZEBRA_SEG6_LOCAL_ACTION_END_DT2U)) {
+			snprintfrr(args->errmsg, args->errmsg_len,
+				   "SID %pI6 is already in use by another SRv6 SID", &sid);
+			return NB_ERR_VALIDATION;
+		}
+		evi = zebra_srv6_evi_lookup(yang_dnode_get_uint32(args->dnode, "../vni"));
+		if (zebra_srv6_evi_explicit_sid_in_use(evi, &sid)) {
+			snprintfrr(args->errmsg, args->errmsg_len,
+				 "SID %pI6 is already assigned to another EVI", &sid);
+			return NB_ERR_VALIDATION;
+		}
+		break;
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		evi = zebra_srv6_evi_lookup(yang_dnode_get_uint32(args->dnode, "../vni"));
+		if (!evi)
+			return NB_ERR;
+		zebra_srv6_evi_set_sid(evi, bum, &sid);
+		break;
+	}
+
+	return NB_OK;
+}
+
+static int zebra_srv6_l2evpn_evi_sid_destroy(struct nb_cb_destroy_args *args, bool bum)
+{
+	struct zebra_srv6_evi *evi;
+
+	if (args->event != NB_EV_APPLY)
+		return NB_OK;
+
+	evi = zebra_srv6_evi_lookup(yang_dnode_get_uint32(args->dnode, "../vni"));
+	if (evi)
+		zebra_srv6_evi_set_sid(evi, bum, NULL);
+
+	return NB_OK;
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/dt2u-sid
+ */
+int zebra_srv6_l2evpn_evi_dt2u_sid_modify(struct nb_cb_modify_args *args)
+{
+	return zebra_srv6_l2evpn_evi_sid_modify(args, false);
+}
+
+int zebra_srv6_l2evpn_evi_dt2u_sid_destroy(struct nb_cb_destroy_args *args)
+{
+	return zebra_srv6_l2evpn_evi_sid_destroy(args, false);
+}
+
+/*
+ * XPath: /frr-zebra:zebra/segment-routing/srv6/l2-evpn/evi/dt2m-sid
+ */
+int zebra_srv6_l2evpn_evi_dt2m_sid_modify(struct nb_cb_modify_args *args)
+{
+	return zebra_srv6_l2evpn_evi_sid_modify(args, true);
+}
+
+int zebra_srv6_l2evpn_evi_dt2m_sid_destroy(struct nb_cb_destroy_args *args)
+{
+	return zebra_srv6_l2evpn_evi_sid_destroy(args, true);
 }
 
 /*

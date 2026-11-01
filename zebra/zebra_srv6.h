@@ -320,6 +320,12 @@ DECLARE_HOOK(srv6_manager_get_locator,
 extern void zebra_srv6_locator_add(struct srv6_locator *locator);
 extern void zebra_srv6_locator_delete(struct srv6_locator *locator);
 extern struct srv6_locator *zebra_srv6_locator_lookup(const char *name);
+extern bool zebra_srv6_sid_value_in_use(const struct in6_addr *sid, uint32_t evi_vni,
+					enum seg6local_action_t behavior);
+extern bool zebra_srv6_locator_check_conflict(const struct srv6_locator *locator,
+					      const struct prefix_ipv6 *prefix, uint8_t block_len,
+					      const struct srv6_sid_format *format, char *err,
+					      size_t err_size);
 
 /* Compose a LOC:FUNC[:WIDE]:: SID under a locator (SRv6 L2 EVPN per-EVI SIDs). */
 extern bool zebra_srv6_l2_sid_compose(struct in6_addr *sid_value, struct srv6_locator *locator,
