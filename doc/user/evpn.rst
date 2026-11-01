@@ -1248,6 +1248,16 @@ zebra commands (under ``segment-routing`` / ``srv6`` / ``l2-evpn``):
    Under an ``evi``, bind a VLAN to the EVI. ``vlan-based`` allows exactly one
    VLAN.
 
+.. clicmd:: sid <dt2u|dt2m> <auto|explicit X:X::X:X>
+
+   Under an ``evi``, choose how the ``End.DT2U`` (unicast) or ``End.DT2M``
+   (BUM) service SID is assigned. ``auto`` (the default) allocates the SID from
+   the EVI's locator. ``explicit`` requests exactly the given SID, which must
+   belong to the EVI's locator, lie in the explicit range of the locator's SID
+   format and not be used by another SID. ``no sid <dt2u|dt2m>`` reverts to
+   ``auto``. Changing the mode releases the current SID and re-advertises the
+   EVI with the new one.
+
 .. clicmd:: l2-encap-mode <full|reduced>
 
    Under an ``evi``, select the SRv6 L2 headend encapsulation used toward remote
@@ -1300,11 +1310,12 @@ BGP commands (under ``router bgp`` / ``address-family l2vpn evpn``):
    Targets. Both ends of a VPWS must share a Route Target for their routes to be
    imported.
 
-.. clicmd:: interface IFNAME [sid auto] bridge IFNAME
+.. clicmd:: interface IFNAME [sid <auto|explicit X:X::X:X>] bridge IFNAME
 
    Under a ``vpws-instance``, bind the customer-facing attachment circuit and
    the pre-created bridge it is enslaved to. ``sid auto`` allocates the
-   ``End.DX2`` SID dynamically from the locator.
+   ``End.DX2`` SID dynamically from the locator; ``sid explicit`` requests the
+   given SID value, which must belong to the instance (or BGP) locator.
 
 .. clicmd:: locator NAME
 
@@ -1333,7 +1344,22 @@ Displaying SRv6 L2 EVPN information
 .. clicmd:: show segment-routing srv6 sid
 
    The per-EVI ``End.DT2U``/``End.DT2M`` and per-VPWS ``End.DX2`` SIDs are
-   listed with their EVI context.
+   listed with their EVI context. ``AllocationType`` is ``dynamic`` or
+   ``explicit``; ``Scope`` is ``global`` for a SID composed with the node part
+   of the locator (RFC 8402 SRGB: routable across the SR domain) and ``local``
+   for a local-only SID (block and function only, RFC 8402 SRLB: meaningful
+   only on the owning node).
+
+.. clicmd:: show segment-routing srv6 block [json]
+
+   Display the SRv6 SID blocks, i.e. the SID space the global SIDs of the
+   domain are taken from: block prefix, SID format, the locators using it, the
+   dynamic and explicit function ranges and how many functions are in use in
+   each.
+
+   Locators must not overlap, and locators sharing a SID block must use the
+   same block length and SID format; zebra rejects a ``prefix`` or ``format``
+   command that would break this.
 
 .. clicmd:: show bgp l2vpn evpn srv6
 

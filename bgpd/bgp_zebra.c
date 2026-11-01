@@ -3818,34 +3818,10 @@ static int bgp_zebra_process_local_vni(ZAPI_CALLBACK_ARGS)
 			struct bgpevpn *vpn = bgp_evpn_lookup_vni(bgp, vni);
 
 			if (vpn) {
-				/*
-				 * A locator change (A -> B) re-allocates this
-				 * EVI's SIDs: zebra frees the old End.DT2U/DT2M
-				 * SIDs and ships the new ones in this VNI_ADD.
-				 * The local decap routes are keyed by the SID
-				 * value (installed via zclient_send_localsid with
-				 * the SID as the prefix), so they MUST be removed
-				 * while the cache still holds the OLD SIDs -
-				 * bgp_evpn_srv6_uninstall_local_decap() deletes
-				 * exactly the cached SIDs.  Overwriting first and
-				 * only adding the new routes would strand the old
-				 * seg6local routes in the kernel/hardware, and a
-				 * later reuse of the freed SID would then forward
-				 * into this (old) EVI.  Only churn the kernel when
-				 * a SID actually changed; an idempotent re-notify
-				 * (same SIDs) leaves the installed decap in place.
-				 */
-				bool dt2u_changed = vpn->srv6_dt2u_sid_valid &&
-						    !IPV6_ADDR_SAME(&vpn->srv6_dt2u_sid,
-								    &srv6_dt2u_sid);
-				bool dt2m_changed = vpn->srv6_dt2m_sid_valid &&
-						    !IPV6_ADDR_SAME(&vpn->srv6_dt2m_sid,
-								    &srv6_dt2m_sid);
-
-				if (dt2u_changed || dt2m_changed)
-					bgp_evpn_srv6_uninstall_local_decap(bgp, vpn,
-									    /*keep_cache=*/false);
-
+				/* Drop decap routes of SIDs this update replaces */
+				bgp_evpn_srv6_uninstall_stale_decap(bgp, vpn, &srv6_dt2u_sid,
+								    srv6_dt2u_oif, &srv6_dt2m_sid,
+								    srv6_dt2m_oif);
 				vpn->srv6_dt2u_sid = srv6_dt2u_sid;
 				vpn->srv6_dt2m_sid = srv6_dt2m_sid;
 				vpn->srv6_dt2u_sid_valid = !IN6_IS_ADDR_UNSPECIFIED(&srv6_dt2u_sid);

@@ -165,6 +165,17 @@ struct zebra_srv6_evi {
 	bool dt2m_sid_valid;
 
 	/*
+	 * Manual SID assignment.  By default (explicit == false) the DT2U/DT2M
+	 * SIDs are allocated dynamically from the EVI's locator.  When the
+	 * operator configures `sid <dt2u|dt2m> explicit X:X::X:X`, the matching
+	 * *_sid_cfg value is requested from the SID manager instead.
+	 */
+	bool dt2u_sid_explicit;
+	bool dt2m_sid_explicit;
+	struct in6_addr dt2u_sid_cfg;
+	struct in6_addr dt2m_sid_cfg;
+
+	/*
 	 * Dedicated, locally-owned decap interface (flood-off sr6) used as the
 	 * l2dev for BOTH this EVI's local End.DT2U and End.DT2M decap routes.
 	 * Lifetime = local EVI config (created in realize, deleted in evi_del),
@@ -240,6 +251,11 @@ extern struct zebra_srv6_evi_bd *zebra_srv6_evi_vlan_find(struct zebra_srv6_evi 
 
 /* Config helpers */
 extern void zebra_srv6_evi_set_locator(struct zebra_srv6_evi *evi, const char *locator);
+/* Per-EVI `sid <dt2u|dt2m> <auto|explicit X:X::X:X>`; @sid NULL selects auto. */
+extern void zebra_srv6_evi_set_sid(struct zebra_srv6_evi *evi, bool bum, const struct in6_addr *sid);
+/* True if @sid is already configured explicitly on an EVI other than @evi. */
+extern bool zebra_srv6_evi_explicit_sid_in_use(const struct zebra_srv6_evi *evi,
+					       const struct in6_addr *sid);
 extern void zebra_srv6_evi_set_bridge(struct zebra_srv6_evi *evi, const char *bridge_name,
 				      struct interface *bridge_if);
 

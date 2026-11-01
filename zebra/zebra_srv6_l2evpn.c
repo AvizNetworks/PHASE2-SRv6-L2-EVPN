@@ -639,6 +639,75 @@ void zebra_srv6_evi_set_locator(struct zebra_srv6_evi *evi, const char *locator)
 	zebra_srv6_evi_realize(evi);
 }
 
+bool zebra_srv6_evi_explicit_sid_in_use(const struct zebra_srv6_evi *evi, const struct in6_addr *sid)
+{
+	struct zebra_srv6_evi *other;
+
+	if (!srv6_evi_inited)
+		return false;
+
+	frr_each (srv6_evi_htab, srv6_evi_table, other) {
+		if (other == evi)
+			continue;
+		if ((other->dt2u_sid_explicit && IPV6_ADDR_SAME(&other->dt2u_sid_cfg, sid)) ||
+		    (other->dt2m_sid_explicit && IPV6_ADDR_SAME(&other->dt2m_sid_cfg, sid)))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Per-EVI `sid <dt2u|dt2m> <auto|explicit X:X::X:X>`.
+ *
+ * Switches the End.DT2U (@bum == false) or End.DT2M (@bum == true) SID of the
+ * EVI between dynamic allocation (@sid == NULL) and a manually configured
+ * value.  A SID already held for that behavior is released first (together
+ * with the local decap interface keyed by the DT2U SID) and realize() draws
+ * the new one, mirroring the runtime locator reassignment above.
+ */
+void zebra_srv6_evi_set_sid(struct zebra_srv6_evi *evi, bool bum, const struct in6_addr *sid)
+{
+	bool *is_explicit;
+	bool *valid;
+	struct in6_addr *cfg;
+	struct srv6_sid_ctx ctx = {};
+
+	if (!evi)
+		return;
+
+	is_explicit = bum ? &evi->dt2m_sid_explicit : &evi->dt2u_sid_explicit;
+	valid = bum ? &evi->dt2m_sid_valid : &evi->dt2u_sid_valid;
+	cfg = bum ? &evi->dt2m_sid_cfg : &evi->dt2u_sid_cfg;
+
+	/* No change -> nothing to do */
+	if (sid ? (*is_explicit && IPV6_ADDR_SAME(cfg, sid)) : !*is_explicit)
+		return;
+
+	if (*valid) {
+		if (!bum && !IN6_IS_ADDR_UNSPECIFIED(&evi->local_decap_sid)) {
+			zebra_sr6_release(&evi->local_decap_sid, evi->local_decap_bridge_ifindex, false);
+			evi->local_decap_oif = 0;
+			memset(&evi->local_decap_sid, 0, sizeof(evi->local_decap_sid));
+		}
+
+		ctx.vrf_id = VRF_DEFAULT;
+		ctx.dt2_bd = evi->vni;
+		ctx.behavior = bum ? ZEBRA_SEG6_LOCAL_ACTION_END_DT2M
+				   : ZEBRA_SEG6_LOCAL_ACTION_END_DT2U;
+		zebra_srv6_l2_sid_release(&ctx, evi->locator);
+		*valid = false;
+	}
+
+	*is_explicit = !!sid;
+	if (sid)
+		*cfg = *sid;
+	else
+		memset(cfg, 0, sizeof(*cfg));
+
+	zebra_srv6_evi_realize(evi);
+}
+
 void zebra_srv6_evi_set_bridge(struct zebra_srv6_evi *evi, const char *bridge_name,
 			       struct interface *bridge_if)
 {
@@ -818,10 +887,35 @@ static bool srv6_evi_alloc_one_sid(struct zebra_srv6_evi *evi, struct srv6_locat
 {
 	struct srv6_sid_ctx ctx = {};
 	struct zebra_srv6_sid *zsid = NULL;
+	struct in6_addr *sid_value = NULL;
 
 	ctx.behavior = behavior;
 	ctx.vrf_id = VRF_DEFAULT;
 	ctx.dt2_bd = evi->vni;
+
+	/* Manual assignment: ask the SID manager for the configured value */
+	if (behavior == ZEBRA_SEG6_LOCAL_ACTION_END_DT2U && evi->dt2u_sid_explicit)
+		sid_value = &evi->dt2u_sid_cfg;
+	else if (behavior == ZEBRA_SEG6_LOCAL_ACTION_END_DT2M && evi->dt2m_sid_explicit)
+		sid_value = &evi->dt2m_sid_cfg;
+
+	/*
+	 * An explicit SID must belong to the locator.  Without this check the SID
+	 * manager would fall back to the parent block and read the node bits as
+	 * the function, so two such SIDs collide on the same function.
+	 */
+	if (sid_value && loc) {
+		struct prefix_ipv6 sid_pfx = { .family = AF_INET6,
+					       .prefixlen = IPV6_MAX_BITLEN,
+					       .prefix = *sid_value };
+
+		if (!prefix_match((struct prefix *)&loc->prefix, (struct prefix *)&sid_pfx)) {
+			zlog_warn("%s: EVI %u: explicit %s %pI6 is outside locator %s (%pFX)",
+				  __func__, evi->vni, seg6local_action2str(behavior), sid_value,
+				  loc->name, &loc->prefix);
+			return false;
+		}
+	}
 
 	/*
 	 * get_srv6_sid() returns 0 when it hands back an existing SID whose
@@ -835,10 +929,17 @@ static bool srv6_evi_alloc_one_sid(struct zebra_srv6_evi *evi, struct srv6_locat
 	 * locator format-change path calls realize() exactly once, so the new
 	 * uSID SID was rejected and the per-EVI decap never reallocated.)
 	 */
-	if (get_srv6_sid(&zsid, &ctx, NULL, evi->locator, false) < 0 || !zsid) {
-		zlog_warn("%s: EVI %u: SID manager declined %s under locator %s", __func__,
-			  evi->vni, seg6local_action2str(behavior), evi->locator);
+	if (get_srv6_sid(&zsid, &ctx, sid_value, evi->locator, false) < 0 || !zsid) {
+		zlog_warn("%s: EVI %u: SID manager declined %s%s%pI6 under locator %s", __func__,
+			  evi->vni, seg6local_action2str(behavior), sid_value ? " explicit " : "",
+			  sid_value ? sid_value : &in6addr_any, evi->locator);
 		return false;
+	}
+
+	/* Explicit allocation: the SID is exactly the configured value */
+	if (sid_value) {
+		*out = *sid_value;
+		return true;
 	}
 
 	/* Dynamic allocation returns the SID object; recompose the address. */
@@ -1703,6 +1804,11 @@ int zebra_srv6_l2evpn_config_write(struct vty *vty)
 		if (evi->l2_encap_mode != ZEBRA_SR6_ENCAP_MODE_FULL)
 			vty_out(vty, "    l2-encap-mode %s\n",
 				zebra_sr6_encap_mode2str(evi->l2_encap_mode));
+		/* Manually assigned service SIDs; auto (dynamic) is the default. */
+		if (evi->dt2u_sid_explicit)
+			vty_out(vty, "    sid dt2u explicit %pI6\n", &evi->dt2u_sid_cfg);
+		if (evi->dt2m_sid_explicit)
+			vty_out(vty, "    sid dt2m explicit %pI6\n", &evi->dt2m_sid_cfg);
 		frr_each (evi_bds, &evi->bds, bd)
 			vty_out(vty, "    vlan %u\n", bd->vid);
 		if (evi->vrf_id != VRF_DEFAULT)

@@ -3288,6 +3288,24 @@ module frr-zebra {
                 "SRv6 L2 (sr6) encapsulation mode applied to this EVI's
                  sr6 tunnel interfaces.";
             }
+            leaf dt2u-sid {
+              type inet:ipv6-address;
+              description
+                "Manually assigned End.DT2U (unicast) SID of this EVI.
+                 It must belong to the EVI's locator and fall in the
+                 explicit range of the locator's SID format.  When the
+                 leaf is absent the SID is allocated automatically from
+                 the locator.";
+            }
+            leaf dt2m-sid {
+              type inet:ipv6-address;
+              description
+                "Manually assigned End.DT2M (BUM) SID of this EVI.  It
+                 must belong to the EVI's locator and fall in the
+                 explicit range of the locator's SID format.  When the
+                 leaf is absent the SID is allocated automatically from
+                 the locator.";
+            }
           }
         }
       }
